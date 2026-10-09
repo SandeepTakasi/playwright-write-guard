@@ -118,6 +118,20 @@ test.describe('the launcher', () => {
     expect(launcher.guard.record()).toMatchObject({ blocked: 2 });
   });
 
+  test('a service worker never becomes ready in its context', async () => {
+    await serve(context);
+    // Newest handler first: the worker script is real JavaScript, so where workers are allowed
+    // it registers and becomes ready, and only the launcher's block makes this test pass.
+    await context.route(`${APP}/sw.js`, (route) => route.fulfill({ status: 200, contentType: 'text/javascript', body: '' }));
+    const page = await open(context);
+    const outcome = await page.evaluate(() => navigator.serviceWorker.register('/sw.js').then(
+      () => Promise.race([navigator.serviceWorker.ready.then(() => 'ready'), new Promise((r) => setTimeout(() => r('no worker'), 1000))]),
+      (e) => `registration failed: ${e.name}`));
+
+    expect(outcome).toBe('no worker');
+    expect(context.serviceWorkers()).toEqual([]);
+  });
+
   test('a destructive click in the client\'s page is refused', async () => {
     await serve(context);
     const page = await open(context);
@@ -193,6 +207,15 @@ test.describe('the initPage entry', () => {
     expect(await send(page, 'GET', '/api/report')).toBe('network error');
     expect(server.writes()).toEqual([]);
     expect(guard.record()).toMatchObject({ installed: true, policy: 'read-only', blocked: 2 });
+  });
+
+  test('locks the request fixture of the page it is handed', async ({ context, page }) => {
+    const server = await serve(context);
+    await initPage({ page });
+
+    await expect(page.request.post(`${APP}/api/items`, { data: {} }))
+      .rejects.toThrow('write-guard: post through APIRequestContext is refused under read-only');
+    expect(server.writes()).toEqual([]);
   });
 
   test('called twice, or for every tab, it installs once', async ({ context, page }) => {
