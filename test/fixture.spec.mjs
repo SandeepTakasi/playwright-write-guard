@@ -4,7 +4,7 @@
 
 import { request as apiRequest, chromium } from '@playwright/test';
 import { execFile } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -274,6 +274,30 @@ test.describe('in a Playwright run of its own', () => {
     expect(results['default config'].status).toBe('failed');
     expect(results['default config'].error).toMatch(/write-guard: .*bad\.json: is not valid JSON/);
     expect(results['used as given'].status).toBe('passed');
+  });
+
+  test('a config naming a log leaves no log file behind', async ({}, testInfo) => {
+    const results = await playwrightRun(testInfo, {
+      spec: `
+        test.describe.serial('blocked write', () => {
+          test.use({ writeGuardConfig: { policy: 'read-only', log: 'write-guard.jsonl' } });
+          let earlier;
+          test('blocks a write', async ({ page }, info) => {
+            earlier = info;
+            await page.route('https://app.test/**', (r) => r.fulfill({ status: 200, contentType: 'text/html', body: '<p>x</p>' }));
+            await page.goto('https://app.test/');
+            expect(await page.evaluate(() => fetch('/api/items', { method: 'POST', body: '{}' }).then((r) => r.status, () => 'failed'))).toBe('failed');
+          });
+          test('recorded the block', () => {
+            const record = JSON.parse(earlier.attachments.find((a) => a.name === 'write-guard.json').body.toString());
+            expect(record.blocked).toBeGreaterThan(0);
+          });
+        });`,
+    });
+    expect(results['blocks a write'].status).toBe('passed');
+    expect(results['recorded the block'].status).toBe('passed');
+    // The nested run's working directory is its project directory; a honoured log would be there.
+    expect(existsSync(join(testInfo.outputPath('project'), 'write-guard.jsonl'))).toBe(false);
   });
 
   test('a test that allows service workers is refused', async ({}, testInfo) => {
