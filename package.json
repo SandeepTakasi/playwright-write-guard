@@ -1,0 +1,78 @@
+{
+  "name": "playwright-write-guard",
+  "version": "0.1.0",
+  "description": "A read-only safety net for Playwright tests and AI browser agents: blocks writes at the network layer and refuses destructive clicks in the page.",
+  "keywords": [
+    "playwright",
+    "testing",
+    "read-only",
+    "safety",
+    "ai-agents",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "Venkata Sandeep Takasi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SandeepTakasi/playwright-write-guard.git"
+  },
+  "homepage": "https://github.com/SandeepTakasi/playwright-write-guard#readme",
+  "bugs": {
+    "url": "https://github.com/SandeepTakasi/playwright-write-guard/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./types/core.d.ts",
+      "default": "./src/core.mjs"
+    },
+    "./install": {
+      "types": "./types/install.d.ts",
+      "default": "./src/install.mjs"
+    },
+    "./test": {
+      "types": "./types/test.d.ts",
+      "default": "./src/fixture.mjs"
+    },
+    "./init-page": {
+      "types": "./types/init-page.d.ts",
+      "default": "./src/init-page.mjs"
+    },
+    "./browser": {
+      "types": "./types/browser.d.ts",
+      "default": "./src/browser.mjs"
+    }
+  },
+  "bin": {
+    "playwright-write-guard-browser": "./bin/browser.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs && playwright test --pass-with-no-tests"
+  },
+  "peerDependencies": {
+    "@playwright/test": ">=1.59",
+    "playwright-core": ">=1.59"
+  },
+  "peerDependenciesMeta": {
+    "@playwright/test": {
+      "optional": true
+    },
+    "playwright-core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "playwright-core": "1.64.0"
+  }
+}
