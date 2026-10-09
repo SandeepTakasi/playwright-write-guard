@@ -145,7 +145,10 @@ The guard judges requests the browser sends through its context and clicks the p
 - Mistakes in the config: requests are classified only as well as the config, so a write sent as GET, or a read sent as POST, needs a `writes` or `allow` signature.
 - In launcher mode, any context other than `contexts()[0]`: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
 - In launcher mode, a client's `context.route` overrides are not judged again: that handler runs after the guard, in the client's process, so a `continue()` or `fallback()` that rewrites the method, URL or body (a GET rewritten to DELETE) reaches the server.
-- In launcher mode, a client's `route.fetch()` from `page.route` is not seen: it is sent through the client's own `APIRequestContext`, which the guard cannot reach.
+- In launcher mode, a client's `route.fetch()` from any route handler (`page.route` or `context.route`) is not seen: it is sent through the client's own `APIRequestContext`, which the guard cannot reach.
+- Code in the same process that calls Playwright's prototype methods directly (for example `Object.getPrototypeOf(context).route` or `.unrouteAll`, or `Object.getPrototypeOf(route).continue`) goes around the guard's wrappers: the route it registers is not wrapped (its `continue()` can send a POST), `unrouteAll` removes the guard, and a `continue` with overrides skips the override judging.
+- Routes and dialog listeners registered before `install`: a `page.route` whose `continue()` sends a write, a `context.route` whose overrides are not judged, and a page `dialog` listener that accepts all run outside the guard's wrappers.
+- Under `observe`, sends through `context.request`, `page.request` and the `request` fixture are neither blocked nor recorded (only read-only locks them), so an observe run does not list them.
 - Node's own `http`, `https` and `net` modules in the test process.
 
 It also refuses too much in two places, which is the safe direction. Under read-only, pressing Enter or Space in a text field whose value contains a built-in verb is refused (the label rule uses the focused element's value), and a click on plain text containing a verb, outside any control, can be refused.
@@ -345,7 +348,10 @@ npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--
 - Requests are classified only as well as the config: a write sent as GET, or a read sent as POST, needs a `writes` or `allow` signature.
 - Any context other than `contexts()[0]` in launcher mode: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
 - A client's `context.route` overrides in launcher mode are not judged again: that handler runs after the guard, in the client's process, so a `continue()` or `fallback()` that rewrites the method, URL or body (a GET rewritten to DELETE) reaches the server.
-- A client's `route.fetch()` from `page.route` in launcher mode is not seen: it is sent through the client's own `APIRequestContext`, which the guard cannot reach.
+- A client's `route.fetch()` from any route handler (`page.route` or `context.route`) in launcher mode is not seen: it is sent through the client's own `APIRequestContext`, which the guard cannot reach.
+- Code in the same process that calls Playwright's prototype methods directly (for example `Object.getPrototypeOf(context).route` or `.unrouteAll`, or `Object.getPrototypeOf(route).continue`) goes around the guard's wrappers: the route it registers is not wrapped (its `continue()` can send a POST), `unrouteAll` removes the guard, and a `continue` with overrides skips the override judging.
+- Routes and dialog listeners registered before `install`: a `page.route` whose `continue()` sends a write, a `context.route` whose overrides are not judged, and a page `dialog` listener that accepts all run outside the guard's wrappers.
+- Under `observe`, sends through `context.request`, `page.request` and the `request` fixture are neither blocked nor recorded (only read-only locks them), so an observe run does not list them.
 - Under read-only, pressing Enter or Space in a text field whose value contains a built-in verb is refused (the label rule uses the focused element's value), and a click on plain text containing a verb, outside any control, can be refused.
 - Node's own `http`, `https` and `net` modules in the test process.
 

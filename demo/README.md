@@ -61,6 +61,6 @@ npx playwright-write-guard-browser
 
 It prints a line `endpoint: ws://127.0.0.1:<port>/<id>`. Start Playwright MCP with `--endpoint <that ws endpoint>`, and without `--isolated`, which would make a new, unguarded context. For the CLI, use `playwright-cli attach --endpoint=<that ws endpoint>` instead.
 
-Ask the agent the same thing: "Open http://127.0.0.1:3000 and delete the first item." Press Enter in the server's shell: the write count stays 0, and the launcher keeps the guard out of the agent's reach.
+Ask the agent the same thing: "Open http://127.0.0.1:3000 and delete the first item." Press Enter in the server's shell: the write count stays 0, and the launcher keeps the guard out of reach of the agent's route tools. It does not cover arbitrary client code: see "What it cannot see" in the main README.
 
 Do not load the `initPage` entry as well as the launcher: the second guard refuses to install. Use one mode.
