@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo items</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; }
+  li { display: flex; justify-content: space-between; align-items: center; padding: .25rem 0; }
+  #status { color: #a00; min-height: 1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Items</h1>
+  <ul id="items" aria-label="Items"></ul>
+  <form id="add">
+    <label for="name">New item name</label>
+    <input id="name" name="name" required>
+    <button type="submit">Add item</button>
+  </form>
+  <p id="status" role="status"></p>
+</main>
+<script>
+const list = document.getElementById('items');
+const status = document.getElementById('status');
+
+async function call(url, options) {
+  try {
+    const res = await fetch(url, options);
+    if (!res.ok) throw new Error('Request failed: ' + res.status);
+    status.textContent = '';
+    return res;
+  } catch (err) {
+    status.textContent = String(err.message || err);
+    return null;
+  }
+}
+
+async function load() {
+  const res = await call('/api/items');
+  if (!res) return;
+  const items = await res.json();
+  list.replaceChildren(...items.map((item) => {
+    const li = document.createElement('li');
+    const span = document.createElement('span');
+    span.textContent = item.name;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Delete';
+    btn.addEventListener('click', async () => {
+      if (await call('/api/items/' + item.id, { method: 'DELETE' })) load();
+    });
+    li.append(span, btn);
+    return li;
+  }));
+}
+
+document.getElementById('add').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('name');
+  const res = await call('/api/items', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: input.value }),
+  });
+  if (res) { input.value = ''; load(); }
+});
+
+load();
+</script>
+</body>
+</html>
