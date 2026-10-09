@@ -115,7 +115,7 @@ It prints `endpoint: <ws endpoint>`. Attach the agent to it:
 - Playwright MCP: start it with `--endpoint <ws endpoint>` and without `--isolated`. `--isolated` makes a new, unguarded context.
 - Playwright CLI: `playwright-cli attach --endpoint=<ws endpoint>`.
 
-The guard runs in the launcher's process, not the agent's. The agent's own `route`, `unroute` and `unrouteAll` tools cannot remove it, and a handler that calls `continue()` still goes through the guard, so this mode survives the route tools the config mode has to deny. Tabs the agent opens in that context are guarded too. Stop it with Ctrl+C.
+The guard runs in the launcher's process, not the agent's. The agent's own `unroute` and `unrouteAll` cannot remove it, and a `page.route` handler that calls `continue()` without overrides is still judged, because page handlers run before the owner's context route. Playwright MCP's own route tool only sets the headers and status of mocked responses, so this mode survives the MCP route tools the config mode has to deny. It does not survive arbitrary client code: see "What it cannot see" below. Tabs the agent opens in that context are guarded too. Stop it with Ctrl+C.
 
 ## The audit log
 
@@ -143,8 +143,9 @@ The guard judges requests the browser sends through its context and clicks the p
 - Drag-and-drop, and pointer or mouse handlers that act before `click`.
 - Client-side-only destructive actions that no click or submit reaches.
 - Mistakes in the config: requests are classified only as well as the config, so a write sent as GET, or a read sent as POST, needs a `writes` or `allow` signature.
-- An isolated MCP session in launcher mode: `--isolated` makes a new, unguarded context.
-- Launcher mode and client routes: an attached client's own `page.route` handlers run before the owner's guard. A `continue()` there still reaches the guard, but a client's `route.fetch()` is sent through the client's own `APIRequestContext`, which the guard cannot reach.
+- In launcher mode, any context other than `contexts()[0]`: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
+- In launcher mode, a client's `context.route` overrides are not judged again: that handler runs after the guard, in the client's process, so a `continue()` or `fallback()` that rewrites the method, URL or body (a GET rewritten to DELETE) reaches the server.
+- In launcher mode, a client's `route.fetch()` from `page.route` is not seen: it is sent through the client's own `APIRequestContext`, which the guard cannot reach.
 - Node's own `http`, `https` and `net` modules in the test process.
 
 It also refuses too much in two places, which is the safe direction. Under read-only, pressing Enter or Space in a text field whose value contains a built-in verb is refused (the label rule uses the focused element's value), and a click on plain text containing a verb, outside any control, can be refused.
@@ -235,7 +236,7 @@ These three functions reference nothing outside their own arguments, because the
 `install(context, config?)` guards one Playwright `BrowserContext` and returns `Promise<GuardHandle>`. It compiles `config` (default `{}`) with `compileConfig`, so a malformed config throws before anything is installed. A second call on the same context returns the first call's handle and ignores its own `config`. It:
 
 1. Registers one catch-all `context.route` before anything else, and judges each request exactly once with `decideRequest`, however many route handlers see it. An allowed or observed request falls back to the next handler and then to the network.
-2. Wraps `context.route` and the `route` of every page in the context, present and future, so the guard judges each request before any handler registered later, and a later handler that calls `continue()` cannot let a blocked request past. The wrapped `unroute` and `unrouteAll` remove only the caller's own handlers, never the guard's.
+2. Wraps `context.route` and the `route` of every page in the context, present and future, so the guard judges each request before any handler registered later, and a later handler that calls `continue()` cannot let a blocked request past. The wrapped `unroute` and `unrouteAll` remove only the caller's own handlers, never the guard's. The route a later handler receives also judges its overrides again: its `continue(options)`, `fallback(options)` and `fetch(options)` are judged as the request they would make when `options` changes the method, URL or body (calls with no options, or headers only, are not judged again, because the original was already judged). Under read-only, a write override makes `continue` and `fallback` abort the request with `'blockedbyclient'` (not the 403 page, even for a document) and makes `fetch` reject with `write-guard: route.fetch of <METHOD> <URL> is refused under read-only`. Under observe the override proceeds. Either way it is recorded once as a `request` event with the effective method and URL, and not counted in `routed_requests`. This applies in the fixture, the `initPage` entry and a direct `install`; in launcher mode it covers only the launcher's own process (see below).
 3. On `block`: a request whose resource type is `document` is fulfilled with status 403, content type `text/html; charset=utf-8`, and a short HTML page reading `write-guard blocked <METHOD> <URL>` (HTML-escaped), so a blocked navigation shows why instead of a browser error page; any other request is aborted with `'blockedbyclient'`, which the page sees as a network error.
 4. Under `websockets: "block"`, refuses every WebSocket under either policy with `context.routeWebSocket`: the socket is closed without connecting to the server and recorded as a `request` event with `action: "block"` and the socket's `url` (no `method`). It is not counted in `routed_requests`.
 5. Adds an init script that runs before any page script, with capture-phase `click`, `submit` and `keydown` (Enter or Space) listeners on `window` that judge the control with `decideControl`. Under `read-only` a destructive control's event is stopped (`preventDefault` and `stopImmediatePropagation`), so the app never sees it; under `observe` it goes through. Either way the page reports the event through the binding `__writeGuardReport`, which the script captures before any page script can replace it.
@@ -321,7 +322,7 @@ Without those entries the agent can remove the guard.
 
 `startGuardedBrowser({ config, headless = true, host = '127.0.0.1', port = 0, title = 'write-guard' })` returns `Promise<{ wsEndpoint, browser, context, guard, close() }>`. It launches Chromium with `playwright-core`, creates one context with `serviceWorkers: 'block'`, guards it with `install(context, config)` (`config` defaults to `loadConfig()`), and calls `browser.bind(title, { host, port })`; `wsEndpoint` is the `endpoint` that returns, `ws://<host>:<port>/<id>` (`port: 0` lets the OS pick a free port). `guard` is the install handle. `close()` waits for `guard.close()`, then closes the context and the browser.
 
-A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded context as `contexts()[0]`. The guard runs in the launcher's process, so the client's own `route`, `continue()` and `unrouteAll()` cannot bypass or remove it, and new tabs it opens in that context are guarded.
+A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded context as `contexts()[0]`. The guard runs in the launcher's process, so the client's own `unroute` and `unrouteAll()` cannot remove it, and a `page.route` handler that calls `continue()` without overrides is still judged (page handlers run before the owner's context route). New tabs the client opens in that context are guarded. A client's `context.route` handler runs after the guard, in the client's process, so its `continue()` or `fallback()` overrides are not judged again, and its `route.fetch()` is not seen; see "What it cannot see" below.
 
 The command does the same from a shell:
 
@@ -342,8 +343,9 @@ npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--
 - Drag-and-drop, and pointer or mouse handlers that act before `click`.
 - Client-side-only destructive actions that no click or submit reaches.
 - Requests are classified only as well as the config: a write sent as GET, or a read sent as POST, needs a `writes` or `allow` signature.
-- An isolated MCP session in launcher mode (`--isolated` makes a new, unguarded context).
-- Launcher mode: an attached client's own `page.route` handlers run before the owner's guard. `continue()` still reaches the guard, but a client's `route.fetch()` is sent through the client's `APIRequestContext`, which the guard cannot reach.
+- Any context other than `contexts()[0]` in launcher mode: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
+- A client's `context.route` overrides in launcher mode are not judged again: that handler runs after the guard, in the client's process, so a `continue()` or `fallback()` that rewrites the method, URL or body (a GET rewritten to DELETE) reaches the server.
+- A client's `route.fetch()` from `page.route` in launcher mode is not seen: it is sent through the client's own `APIRequestContext`, which the guard cannot reach.
 - Under read-only, pressing Enter or Space in a text field whose value contains a built-in verb is refused (the label rule uses the focused element's value), and a click on plain text containing a verb, outside any control, can be refused.
 - Node's own `http`, `https` and `net` modules in the test process.
 
