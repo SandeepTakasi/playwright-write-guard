@@ -82,6 +82,22 @@ async function setup(context, raw, cfg) {
     return false;
   };
 
+  // A caller handler's continue, fallback or fetch overrides are judged as the request they
+  // make; one the original already matches was judged above. True means let it proceed.
+  const judgeOverride = (route, options = {}) => {
+    const req = route.request();
+    let original = null;
+    try { original = req.postData(); } catch { /* an undecodable body is judged as none */ }
+    const p = options.postData;
+    const body = p == null ? original : typeof p === 'string' ? p : Buffer.isBuffer(p) ? p.toString('utf8') : JSON.stringify(p);
+    const method = String(options.method || req.method()).toUpperCase();
+    const url = options.url || req.url();
+    if (method === req.method() && url === req.url() && body === original) return { pass: true };
+    const v = decideRequest({ method, url, body }, cfg);
+    if (v.action !== 'allow') emit({ kind: 'request', action: v.action, reason: v.reason, method, url });
+    return { pass: v.action !== 'block', method, url };
+  };
+
   // A predicate, not a glob, so no caller's unroute(url) can name it.
   await context.route(() => true, async (route) => { if (await judge(route)) await route.fallback(); });
 
@@ -94,10 +110,10 @@ async function setup(context, raw, cfg) {
 
   await context.addInitScript({ content: pageScript(raw) });
 
-  patchRoutes(context, judge);
+  patchRoutes(context, judge, judgeOverride);
   if (cfg.policy === 'read-only') lockRequest(context);
   const onPage = (page) => {
-    patchRoutes(page, judge);
+    patchRoutes(page, judge, judgeOverride);
     if (cfg.policy !== 'read-only') return;
     lockRequest(page);
     page.on('dialog', (d) => d.dismiss().catch(() => {}));
@@ -120,16 +136,37 @@ const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const blockedPage = (method, url) => `<!doctype html><html><head><meta charset="utf-8"><title>write-guard</title></head>`
   + `<body><p>write-guard blocked ${escapeHtml(method)} ${escapeHtml(url)}</p></body></html>`;
 
+// The route a caller's handler gets: continue, fallback and fetch judge their overrides first,
+// and everything else is the original Route.
+function judgedRoute(r, judgeOverride) {
+  return new Proxy(r, {
+    get(obj, prop) {
+      if (prop === 'continue' || prop === 'fallback') {
+        return async (options) => (judgeOverride(obj, options).pass ? obj[prop](options) : obj.abort('blockedbyclient'));
+      }
+      if (prop === 'fetch') {
+        return async (options) => {
+          const v = judgeOverride(obj, options);
+          if (!v.pass) throw new Error(`write-guard: route.fetch of ${v.method} ${v.url} is refused under read-only`);
+          return obj.fetch(options);
+        };
+      }
+      const v = Reflect.get(obj, prop, obj);
+      return typeof v === 'function' ? v.bind(obj) : v;
+    },
+  });
+}
+
 // Every handler a caller registers asks the guard first; unroute and unrouteAll remove only
 // the caller's own handlers.
-function patchRoutes(target, judge) {
+function patchRoutes(target, judge, judgeOverride) {
   const route = target.route.bind(target);
   const unroute = target.unroute.bind(target);
   const tracked = [];
   const sameUrl = (a, b) => a === b
     || (a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags);
   target.route = (url, handler, options) => {
-    const wrapped = async (r, request) => { if (await judge(r)) return handler(r, request); };
+    const wrapped = async (r, request) => { if (await judge(r)) return handler(judgedRoute(r, judgeOverride), request); };
     tracked.push({ url, handler, wrapped });
     // The returned disposable calls target.unroute(url, wrapped), which lands below.
     return route(url, wrapped, options);
@@ -140,7 +177,7 @@ function patchRoutes(target, judge) {
       await unroute(t.url, t.wrapped);
     }
   };
-  // ponytail: unrouteAll's `behavior` option is ignored; the guard never waits on a caller's handlers.
+  // unrouteAll's `behavior` option is ignored; the guard never waits on a caller's handlers.
   target.unrouteAll = async () => {
     for (const t of tracked.splice(0)) await unroute(t.url, t.wrapped);
   };

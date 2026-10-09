@@ -14,8 +14,15 @@ const HOME = `<!doctype html>
 <button id="view" onclick="window.hits.push('view')">View</button>
 <button id="trash" onclick="window.hits.push('trash')"><i class="icon-trash"></i></button>`;
 
+const CONTROLS = `<!doctype html>
+<script>window.hits = [];</script>
+<form id="save" onsubmit="window.hits.push('save'); return false"><button>Save</button></form>
+<form id="find" onsubmit="window.hits.push('find'); return false"><button>Search</button></form>
+<div id="remove" tabindex="0" onkeydown="window.hits.push('remove ' + event.code)">Delete</div>
+<div id="open" tabindex="0" onkeydown="window.hits.push('open ' + event.code)">Open</div>`;
+
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
-// records every request that reaches it.
+// records every request that reaches it. `/controls` serves CONTROLS, any other page HOME.
 async function serve(context) {
   const seen = [];
   await context.route(`${APP}/**`, async (route) => {
@@ -25,7 +32,7 @@ async function serve(context) {
     if (url.pathname.startsWith('/api/')) {
       return route.fulfill({ status: 200, contentType: 'application/json', body: SERVED });
     }
-    return route.fulfill({ status: 200, contentType: 'text/html', body: HOME });
+    return route.fulfill({ status: 200, contentType: 'text/html', body: url.pathname === '/controls' ? CONTROLS : HOME });
   });
   return { seen, writes: () => seen.filter((s) => !s.startsWith('GET ')) };
 }
@@ -39,6 +46,8 @@ async function open(context) {
 const send = (page, method) => page.evaluate((m) => fetch('/api/items', { method: m, body: m === 'GET' ? undefined : '{}' })
   .then((r) => r.text(), () => 'network error'), method);
 const hits = (page) => page.evaluate(() => window.hits);
+const write = (action, method) => ({ kind: 'request', action, reason: expect.any(String), method, url: `${APP}/api/items`, at: expect.any(String) });
+const control = (label) => ({ kind: 'control', action: 'block', reason: expect.any(String), label, at: expect.any(String) });
 
 test('blocks a write, records it, and lets reads through', async ({ context }) => {
   const server = await serve(context);
@@ -87,6 +96,95 @@ test('a later route with continue() cannot let a blocked request past', async ({
   expect(calls).toBe(0);
   expect(server.writes()).toEqual([]);
   expect(guard.record().blocked).toBe(1);
+});
+
+test('a read rewritten into a write by continue() is blocked and recorded', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  const routed = guard.record().routed_requests;
+
+  await context.route('**/api/items', (route) => route.continue({ method: 'DELETE' }));
+  expect(await send(page, 'GET')).toBe('network error');
+  await context.unrouteAll();
+  await page.route('**/api/items', (route) => route.continue({ method: 'delete' }));
+  expect(await send(page, 'GET')).toBe('network error');
+
+  expect(server.writes()).toEqual([]);
+  const record = guard.record();
+  expect(record.events).toEqual([write('block', 'DELETE'), write('block', 'DELETE')]);
+  expect(record.blocked).toBe(2);
+  // Each GET is judged once; the overrides are not counted.
+  expect(record.routed_requests).toBe(routed + 2);
+});
+
+test('a read rewritten into a write by fallback() is blocked and recorded', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null, writes: [{ method: 'GET', url: '/api/items$', body: 'drop' }] });
+  const page = await open(context);
+
+  await context.route('**/api/items', (route) => route.fallback({ method: 'POST' }));
+  expect(await send(page, 'GET')).toBe('network error');
+  await context.unrouteAll();
+  // A Buffer body is read as UTF-8, an object as its JSON.
+  let override;
+  await page.route('**/api/items', (route) => route.fallback(override));
+  for (override of [{ method: 'POST' }, { postData: Buffer.from('drop it') }, { postData: { op: 'drop' } }]) {
+    expect(await send(page, 'GET')).toBe('network error');
+  }
+
+  expect(server.writes()).toEqual([]);
+  expect(server.seen.filter((s) => s === 'GET /api/items')).toEqual([]);
+  expect(guard.record().events).toEqual([write('block', 'POST'), write('block', 'POST'), write('block', 'GET'), write('block', 'GET')]);
+});
+
+test('route.fetch of a write is refused under read-only', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  let message;
+  await page.route('**/api/items', async (route) => {
+    message = await route.fetch({ method: 'POST', postData: '{}' }).then(() => 'fetched', (e) => e.message);
+    return route.fulfill({ body: 'mocked' });
+  });
+
+  expect(await send(page, 'GET')).toBe('mocked');
+  expect(message).toBe(`write-guard: route.fetch of POST ${APP}/api/items is refused under read-only`);
+  expect(server.writes()).toEqual([]);
+  expect(guard.record().events).toEqual([write('block', 'POST')]);
+});
+
+test('under observe an override goes through and is recorded once', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { policy: 'observe', log: null });
+  const page = await open(context);
+  const routed = guard.record().routed_requests;
+  await page.route('**/api/items', (route) => route.fallback({ method: 'POST' }));
+
+  expect(await send(page, 'GET')).toBe(SERVED);
+  expect(server.writes()).toEqual(['POST /api/items']);
+  expect(guard.record()).toMatchObject({ blocked: 0, observed: 1, routed_requests: routed + 1, events: [write('observe', 'POST')] });
+});
+
+test('unroute(url, handler) removes that handler and keeps the others', async ({ context }) => {
+  await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  const seen = [];
+  const keep = (route) => { seen.push('keep'); return route.fallback(); };
+  const drop = (route) => { seen.push('drop'); return route.fallback(); };
+  for (const target of [context, page]) {
+    await target.route('**/api/items', keep);
+    await target.route('**/api/items', drop);
+  }
+  expect(await send(page, 'GET')).toBe(SERVED);
+  expect(seen).toEqual(['drop', 'keep', 'drop', 'keep']);
+
+  seen.length = 0;
+  await context.unroute('**/api/items', drop);
+  await page.unroute('**/api/items', drop);
+  expect(await send(page, 'GET')).toBe(SERVED);
+  expect(seen).toEqual(['keep', 'keep']);
 });
 
 test('unrouteAll and unroute remove only the caller\'s own handlers', async ({ context }) => {
@@ -142,6 +240,69 @@ test('native dialogs are dismissed under read-only', async ({ context }) => {
   await install(context, { log: null });
   const page = await open(context);
   expect(await page.evaluate(() => confirm('Delete everything?'))).toBe(false);
+});
+
+test('a form sent with requestSubmit() is judged by its label', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await context.newPage();
+  await page.goto(`${APP}/controls`);
+
+  await page.evaluate(() => {
+    document.getElementById('save').requestSubmit();
+    document.getElementById('find').requestSubmit();
+  });
+  expect(await hits(page)).toEqual(['find']);
+  await expect.poll(() => guard.record().blocked).toBe(1);
+  expect(guard.record().events).toEqual([control('Save')]);
+});
+
+test('Space on a focusable element is judged by its label', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await context.newPage();
+  await page.goto(`${APP}/controls`);
+
+  // No click handler anywhere: only the keydown listener stands between Space and the app.
+  await page.focus('#remove');
+  await page.keyboard.press('Space');
+  await page.focus('#open');
+  await page.keyboard.press('Space');
+  expect(await hits(page)).toEqual(['open Space']);
+  await expect.poll(() => guard.record().blocked).toBe(1);
+  expect(guard.record().events).toEqual([control('Delete')]);
+});
+
+test('dialogs are dismissed even when the caller accepts them', async ({ context }) => {
+  await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  page.on('dialog', (d) => d.accept().catch(() => {}));
+  expect(await page.evaluate(() => confirm('Delete everything?'))).toBe(false);
+});
+
+test('install locks the request of a page that already exists', async ({ context, page }) => {
+  await install(context, { log: null });
+  await expect(page.request.post(`${APP}/api/items`)).rejects
+    .toThrow('write-guard: post through APIRequestContext is refused under read-only');
+});
+
+test('the 403 page HTML-escapes the URL', async ({ context }) => {
+  await serve(context);
+  await install(context, { log: null, writes: [{ method: 'GET', url: '/api/' }] });
+  const page = await context.newPage();
+
+  const res = await page.goto(`${APP}/api/it's<b>?a=1&b=2`);
+  expect(res.status()).toBe(403);
+  const url = res.url();
+  expect(url).toContain("it's");
+  expect(url).toContain('&b=2');
+  const html = await res.text();
+  expect(html).toContain('it&#39;s');
+  expect(html).toContain('a=1&#38;b=2');
+  expect(html).not.toContain("it's");
+  expect(html).not.toContain('<b>');
+  await expect(page.locator('body')).toHaveText(`write-guard blocked GET ${url}`);
 });
 
 test('observe records writes and controls without blocking them', async ({ context }) => {
