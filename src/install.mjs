@@ -111,12 +111,15 @@ async function setup(context, raw, cfg) {
   await context.addInitScript({ content: pageScript(raw) });
 
   patchRoutes(context, judge, judgeOverride);
-  if (cfg.policy === 'read-only') lockRequest(context);
+  if (cfg.policy === 'read-only') {
+    lockRequest(context);
+    // The context's dialog event is emitted before any page's, so this runs ahead of every
+    // listener a caller adds later; their accept() then finds the dialog already handled.
+    context.on('dialog', (d) => d.dismiss().catch(() => {}));
+  }
   const onPage = (page) => {
     patchRoutes(page, judge, judgeOverride);
-    if (cfg.policy !== 'read-only') return;
-    lockRequest(page);
-    page.on('dialog', (d) => d.dismiss().catch(() => {}));
+    if (cfg.policy === 'read-only') lockRequest(page);
   };
   for (const p of context.pages()) onPage(p);
   context.on('page', onPage);

@@ -257,28 +257,50 @@ test('a form sent with requestSubmit() is judged by its label', async ({ context
   expect(guard.record().events).toEqual([control('Save')]);
 });
 
-test('Space on a focusable element is judged by its label', async ({ context }) => {
+test('Space and Enter on a focusable element are judged by its label', async ({ context }) => {
   await serve(context);
   const guard = await install(context, { log: null });
   const page = await context.newPage();
   await page.goto(`${APP}/controls`);
 
-  // No click handler anywhere: only the keydown listener stands between Space and the app.
-  await page.focus('#remove');
-  await page.keyboard.press('Space');
-  await page.focus('#open');
-  await page.keyboard.press('Space');
-  expect(await hits(page)).toEqual(['open Space']);
-  await expect.poll(() => guard.record().blocked).toBe(1);
-  expect(guard.record().events).toEqual([control('Delete')]);
+  // No click handler anywhere, and a div has no click activation on either key: only the
+  // keydown listener stands between the key and the app.
+  for (const key of ['Space', 'Enter']) {
+    await page.focus('#remove');
+    await page.keyboard.press(key);
+    await page.focus('#open');
+    await page.keyboard.press(key);
+  }
+  expect(await hits(page)).toEqual(['open Space', 'open Enter']);
+  await expect.poll(() => guard.record().blocked).toBe(2);
+  expect(guard.record().events).toEqual([control('Delete'), control('Delete')]);
 });
 
 test('dialogs are dismissed even when the caller accepts them', async ({ context }) => {
   await serve(context);
   await install(context, { log: null });
   const page = await open(context);
+  // The context's dialog event is emitted before the page's; both callers lose.
+  context.on('dialog', (d) => d.accept().catch(() => {}));
   page.on('dialog', (d) => d.accept().catch(() => {}));
   expect(await page.evaluate(() => confirm('Delete everything?'))).toBe(false);
+});
+
+test('a URL rewritten by continue() or fallback() is judged as the new URL', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null, writes: [{ method: 'GET', url: '/api/danger$' }] });
+  const page = await open(context);
+  const danger = `${APP}/api/danger`;
+
+  await page.route('**/api/items', (route) => route.continue({ url: danger }));
+  expect(await send(page, 'GET')).toBe('network error');
+  await page.unrouteAll();
+  await page.route('**/api/items', (route) => route.fallback({ url: danger }));
+  expect(await send(page, 'GET')).toBe('network error');
+
+  expect(server.seen.filter((s) => s.includes('/api/'))).toEqual([]);
+  const blocked = { kind: 'request', action: 'block', reason: expect.any(String), method: 'GET', url: danger, at: expect.any(String) };
+  expect(guard.record().events).toEqual([blocked, blocked]);
 });
 
 test('install locks the request of a page that already exists', async ({ context, page }) => {
