@@ -10,10 +10,8 @@
  * Throws `write-guard: <path>: <message>` on anything malformed.
  */
 export function compileConfig(raw) {
-  const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', '*'];
-  const VERBS = ['save', 'delete', 'remove', 'publish', 'share', 'submit', 'send', 'archive', 'upload',
-    'import', 'rename', 'duplicate', 'update', 'confirm', 'pay', 'purchase', 'invite', 'reset',
-    'restore', 'approve', 'reject', 'log out', 'sign out'];
+  const VERBS = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase',
+    'log out', 'sign out', 'logout'];
   const fail = (path, message) => { throw new Error(`write-guard: ${path}: ${message}`); };
   const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   const list = (v, path) => {
@@ -33,11 +31,16 @@ export function compileConfig(raw) {
   const sigs = (v, key) => list(v, key).map((s, i) => {
     const at = `${key}[${i}]`;
     if (!isObj(s)) fail(at, 'must be an object');
-    if (!METHODS.includes(s.method)) fail(`${at}.method`, `must be one of ${METHODS.join(' | ')}`);
+    if (s.method !== '*' && !(typeof s.method === 'string' && /^[A-Za-z][A-Za-z0-9-]*$/.test(s.method))) {
+      fail(`${at}.method`, 'must be "*" or a method name');
+    }
+    const hs = s.headers === undefined || s.headers === null ? {} : s.headers;
+    if (!isObj(hs)) fail(`${at}.headers`, 'must be an object');
     return {
-      method: s.method,
+      method: s.method.toUpperCase(),
       url: regex(s.url, `${at}.url`, ''),
       body: s.body === undefined || s.body === null ? null : regex(s.body, `${at}.body`, ''),
+      headers: Object.keys(hs).map((k) => ({ name: k.toLowerCase(), value: regex(hs[k], `${at}.headers.${k}`, '') })),
     };
   });
 
@@ -51,6 +54,7 @@ export function compileConfig(raw) {
   if (cfg.log !== undefined && cfg.log !== null && (typeof cfg.log !== 'string' || cfg.log === '')) {
     fail('log', 'must be a non-empty string or null');
   }
+  if (cfg.logBodies !== undefined && typeof cfg.logBodies !== 'boolean') fail('logBodies', 'must be a boolean');
 
   const policy = oneOf(cfg.policy, ['read-only', 'observe'], 'read-only', 'policy');
   const websockets = oneOf(cfg.websockets, ['allow', 'block'], 'allow', 'websockets');
@@ -73,6 +77,7 @@ export function compileConfig(raw) {
     icons: [...icons],
     websockets,
     log: cfg.log === undefined ? 'write-guard.jsonl' : cfg.log,
+    logBodies: cfg.logBodies === true,
   };
 }
 
@@ -81,8 +86,11 @@ export function decideRequest(request, config) {
   const method = String(request.method ?? '').toUpperCase();
   const url = String(request.url ?? '');
   const body = request.body;
+  const headers = {};
+  for (const k of Object.keys(request.headers ?? {})) headers[k.toLowerCase()] = request.headers[k];
   const matches = (s) => (s.method === '*' || s.method === method) && s.url.test(url)
-    && (s.body === null || (typeof body === 'string' && s.body.test(body)));
+    && (s.body === null || (typeof body === 'string' && s.body.test(body)))
+    && s.headers.every((h) => typeof headers[h.name] === 'string' && h.value.test(headers[h.name]));
 
   const allowed = config.allow.findIndex(matches);
   if (allowed !== -1) return { action: 'allow', reason: `allow[${allowed}] marks it a read` };

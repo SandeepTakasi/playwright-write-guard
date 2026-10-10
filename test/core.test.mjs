@@ -30,6 +30,7 @@ test('compileConfig applies every default for null, undefined and {}', () => {
     assert.deepEqual(c.icons, []);
     assert.equal(c.websockets, 'allow');
     assert.equal(c.log, 'write-guard.jsonl');
+    assert.equal(c.logBodies, false);
   }
 });
 
@@ -60,13 +61,29 @@ test('built-in verbs match as whole words, case-insensitive', () => {
   assert.ok(!text.test('Payment history'), 'payment is not pay');
 });
 
-test('all 23 built-in verbs are present', () => {
+test('the 11 built-in verbs are present and every dropped one is absent', () => {
   const { text } = cfg();
-  const verbs = ['save', 'delete', 'remove', 'publish', 'share', 'submit', 'send', 'archive', 'upload',
-    'import', 'rename', 'duplicate', 'update', 'confirm', 'pay', 'purchase', 'invite', 'reset',
-    'restore', 'approve', 'reject', 'log out', 'sign out'];
-  assert.equal(verbs.length, 23);
+  const verbs = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase',
+    'log out', 'sign out', 'logout'];
+  assert.equal(verbs.length, 11);
   for (const v of verbs) assert.ok(text.test(v), v);
+  const dropped = ['share', 'submit', 'upload', 'import', 'rename', 'duplicate', 'update', 'confirm',
+    'invite', 'reset', 'restore', 'approve', 'reject'];
+  for (const v of dropped) assert.ok(!text.test(v), v);
+  assert.ok(!text.test('Reset filters'));
+});
+
+test('logout matches as a whole word, case-insensitive', () => {
+  const { text } = cfg();
+  assert.ok(text.test('Logout'));
+  assert.ok(text.test('LOGOUT now'));
+  assert.ok(!text.test('Logouts'));
+});
+
+test('logBodies defaults to false and accepts a boolean', () => {
+  assert.equal(cfg().logBodies, false);
+  assert.equal(cfg({ logBodies: false }).logBodies, false);
+  assert.equal(cfg({ logBodies: true }).logBodies, true);
 });
 
 test('controls.text is added to the built-ins, never replacing them', () => {
@@ -100,6 +117,26 @@ test('signatures compile with method, url and optional body', () => {
   assert.equal(cfg({ allow: [{ method: 'GET', url: 'x', body: null }] }).allow[0].body, null);
 });
 
+test('a signature without headers compiles to an empty headers list', () => {
+  const c = cfg({ allow: [{ method: 'GET', url: 'x' }, { method: 'GET', url: 'y', headers: null }] });
+  assert.deepEqual(c.allow[0].headers, []);
+  assert.deepEqual(c.allow[1].headers, []);
+});
+
+test('signature headers compile to lower-case names with regex values', () => {
+  const c = cfg({ allow: [{ method: 'POST', url: 'x', headers: { 'Next-Action': '^abc$', 'X-Y': 'z' } }] });
+  const h = c.allow[0].headers;
+  assert.deepEqual(h.map((e) => e.name), ['next-action', 'x-y']);
+  assert.ok(h[0].value instanceof RegExp);
+  assert.equal(h[0].value.flags, '');
+});
+
+test('any method token is compiled to upper case', () => {
+  const c = cfg({ allow: [{ method: 'report', url: 'x' }, { method: 'M-Search', url: 'x' }, { method: 'post', url: 'x' }] });
+  assert.deepEqual(c.allow.map((s) => s.method), ['REPORT', 'M-SEARCH', 'POST']);
+  assert.equal(cfg({ writes: [{ method: '*', url: 'x' }] }).writes[0].method, '*');
+});
+
 // --- compileConfig: malformed configs ----------------------------------------------
 
 const bad = (raw, path) => assert.throws(
@@ -116,9 +153,37 @@ test('policy, websockets and method outside their values throw', () => {
   bad({ policy: 'readonly' }, 'policy');
   bad({ policy: 'unrestricted' }, 'policy');
   bad({ websockets: 'deny' }, 'websockets');
-  bad({ allow: [{ method: 'post', url: 'x' }] }, 'allow[0].method');
-  bad({ writes: [{ method: 'FETCH', url: 'x' }] }, 'writes[0].method');
   bad({ writes: [{ url: 'x' }] }, 'writes[0].method');
+});
+
+test('malformed methods throw with the contract message', () => {
+  for (const method of ['', '1POST', 'PO ST', 'PO_ST', '-X', 'POST ', '**', 5, null, ['POST']]) {
+    assert.throws(
+      () => cfg({ allow: [{ method, url: 'x' }] }),
+      { message: 'write-guard: allow[0].method: must be "*" or a method name' },
+      String(method),
+    );
+  }
+  bad({ writes: [{ method: 'GET', url: 'x' }, { method: 'a b', url: 'x' }] }, 'writes[1].method');
+});
+
+test('malformed headers throw with their paths', () => {
+  for (const headers of ['x', 5, true, ['a']]) {
+    assert.throws(
+      () => cfg({ allow: [{ method: 'GET', url: 'x', headers }] }),
+      { message: 'write-guard: allow[0].headers: must be an object' },
+    );
+  }
+  bad({ writes: [{ method: 'GET', url: 'x', headers: { 'Next-Action': '' } }] }, 'writes[0].headers.Next-Action');
+  bad({ writes: [{ method: 'GET', url: 'x', headers: { 'Next-Action': 5 } }] }, 'writes[0].headers.Next-Action');
+  bad({ writes: [{ method: 'GET', url: 'x', headers: { 'Next-Action': null } }] }, 'writes[0].headers.Next-Action');
+  bad({ allow: [{ method: 'GET', url: 'x', headers: { ok: 'a', 'X-Bad': '(' } }] }, 'allow[0].headers.X-Bad');
+});
+
+test('logBodies that is not a boolean throws', () => {
+  for (const logBodies of ['yes', 1, null, 0, []]) {
+    assert.throws(() => cfg({ logBodies }), { message: 'write-guard: logBodies: must be a boolean' });
+  }
 });
 
 test('lists that are not lists throw', () => {
@@ -186,6 +251,36 @@ test('method * in a signature matches any method', () => {
   const c = cfg({ writes: [{ method: '*', url: '/upload' }] });
   assert.equal(decideRequest(req('GET', 'https://a.test/upload'), c).action, 'block');
   assert.equal(decideRequest(req('HEAD', 'https://a.test/upload'), c).action, 'block');
+});
+
+test('an extension method signature matches that method in any case', () => {
+  const c = cfg({ allow: [{ method: 'report', url: '/x$' }] });
+  assert.equal(decideRequest(req('REPORT', 'https://a.test/x'), c).action, 'allow');
+  assert.equal(decideRequest(req('report', 'https://a.test/x'), c).action, 'allow');
+  assert.equal(decideRequest(req('PROPFIND', 'https://a.test/x'), c).action, 'block');
+});
+
+test('header signatures match case-insensitive names and need every header', () => {
+  const c = cfg({ allow: [{ method: 'POST', url: '/x$', headers: { 'Next-Action': '^abc$' } }] });
+  const r = (headers) => decideRequest({ method: 'POST', url: 'https://a.test/x', headers }, c).action;
+  assert.equal(r({ 'next-action': 'abc' }), 'allow');
+  assert.equal(r({ 'NEXT-ACTION': 'abc' }), 'allow');
+  assert.equal(r({ 'Next-Action': 'abcd' }), 'block', 'value must match');
+  assert.equal(r({ 'x-other': 'abc' }), 'block', 'header must be present');
+  assert.equal(r({}), 'block');
+  assert.equal(r(undefined), 'block');
+  assert.equal(r(null), 'block', 'headers null means none');
+  const two = cfg({ allow: [{ method: 'POST', url: '/x$', headers: { a: '1', b: '2' } }] });
+  const t = (headers) => decideRequest({ method: 'POST', url: 'https://a.test/x', headers }, two).action;
+  assert.equal(t({ A: '1', B: '2' }), 'allow');
+  assert.equal(t({ A: '1' }), 'block');
+});
+
+test('a header value regex is case-sensitive and unanchored', () => {
+  const c = cfg({ writes: [{ method: 'GET', url: '/x$', headers: { 'x-t': 'drop' } }] });
+  const r = (v) => decideRequest({ method: 'GET', url: 'https://a.test/x', headers: { 'X-T': v } }, c).action;
+  assert.equal(r('a drop b'), 'block');
+  assert.equal(r('DROP'), 'allow');
 });
 
 test('an OPTIONS signature compiles and matches an OPTIONS request', () => {
@@ -297,7 +392,8 @@ test('with defaultControls false and no text only icons can match', () => {
 test('each function behaves identically when rebuilt from its own source text', () => {
   const rebuild = (fn) => new Function(`return ${fn.toString()}`)();
   const [compile2, control2, request2] = [compileConfig, decideControl, decideRequest].map(rebuild);
-  for (const raw of [undefined, { policy: 'observe' }, { ...GRAPHQL, controls: { icons: ['icon-trash'], text: ['nuke'] } }]) {
+  const HDR = { allow: [{ method: 'report', url: '/h$', headers: { 'X-A': '^1$' } }], logBodies: true };
+  for (const raw of [undefined, { policy: 'observe' }, HDR, { ...GRAPHQL, controls: { icons: ['icon-trash'], text: ['nuke'] } }]) {
     const c1 = cfg(raw);
     const c2 = compile2(raw);
     assert.deepEqual(c2, c1);
@@ -305,7 +401,8 @@ test('each function behaves identically when rebuilt from its own source text', 
       assert.deepEqual(control2(k, c2), decideControl(k, c1));
     }
     for (const r of [req('POST', 'https://a.test/graphql', MUTATION), req('POST', 'https://a.test/graphql', QUERY),
-      req('DELETE', 'https://a.test/api/1'), req('GET', 'https://a.test/x'), req('post', 'https://a.test/api/search')]) {
+      req('DELETE', 'https://a.test/api/1'), req('GET', 'https://a.test/x'), req('post', 'https://a.test/api/search'),
+      { method: 'report', url: 'https://a.test/h', headers: { 'x-a': '1' } }, { method: 'REPORT', url: 'https://a.test/h' }]) {
       assert.deepEqual(request2(r, c2), decideRequest(r, c1));
     }
   }
