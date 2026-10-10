@@ -1,6 +1,6 @@
 {
   "name": "playwright-write-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A read-only safety net for Playwright tests and AI browser agents: blocks writes at the network layer and refuses destructive clicks in the page.",
   "keywords": [
     "playwright",
