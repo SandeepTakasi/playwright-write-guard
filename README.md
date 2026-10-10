@@ -12,6 +12,12 @@ This package puts a read-only guard in front of the browser:
 - **Clicks.** A click, form submit, or Enter or Space keypress on a control whose label is a destructive verb (Save, Delete, Publish, Send and so on) is stopped inside the page before the app's own handlers run. Native confirmation dialogs are declined.
 - **Log.** Every write it blocked, or only observed under the `observe` policy, is recorded as one JSON line.
 
+What it guarantees, and what it does not:
+
+- **Enforced:** every request the pages of a guarded context send is judged at the network layer, whatever triggered it. This is the main layer: a "Continue" button that submits a payment still sends a request, and that request is judged.
+- **Heuristic:** which requests count as writes (by method, unless your `allow` and `writes` signatures say otherwise) and which controls count as destructive (by label). The click check is a second layer that stops the app before it starts a write. It can refuse a harmless "Save" (set `defaultControls: false` to drop the built-in verbs) and miss a destructive control with an innocent label.
+- **Not covered:** anything outside the guarded context, such as other contexts, request clients the guard cannot reach, and code that removes the guard. See [What it cannot see](#what-it-cannot-see). The boundary is a restricted account: give the run credentials that cannot write, and use the guard to catch mistakes before they reach it.
+
 See it work end to end, with a local page and a local server, in the walkthrough at [demo/README.md](demo/README.md) (`node demo/run.mjs`).
 
 ## Install
@@ -66,7 +72,9 @@ WRITE_GUARD_CONFIG=/path/to/write-guard.config.json npx playwright test -c confi
 
 ## Use with AI agents
 
-Pick one mode for a given browser. Using both at once is refused: the second guard throws `write-guard: this context is already guarded by another process; use one mode, not both`.
+Pick one mode for a given browser. Using both at once is refused: the second guard throws `write-guard: this context is already guarded by another process; use one mode, not both`, and Playwright MCP then fails every tool call with that message.
+
+Config mode depends on denying the agent its code-running and routing tools; the example below is for Claude Code. If your agent cannot deny tools that way, use launcher mode. Both modes were checked with Playwright MCP 0.0.83 driving the demo app: the agent's Delete click was refused in the page, its `fetch` DELETE was blocked at the network, and the server received no writes.
 
 ### Config mode: the `initPage` entry
 

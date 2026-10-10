@@ -19,6 +19,8 @@ try {
   const page = await client.contexts()[0].newPage();
   await page.goto(server.url);
   await page.getByRole('button', { name: 'Delete' }).first().waitFor();
+  // Reads go through: the page loaded its list with a GET.
+  console.log(`read: ${await page.getByRole('listitem').count()} items listed`);
 
   // 1. Click Delete: the guard refuses the click inside the page, so the app never sees it.
   await page.getByRole('button', { name: 'Delete' }).first().click();
@@ -32,7 +34,10 @@ try {
   console.log(`fetch DELETE: ${outcome}`);
 
   writes = server.stats().writes;
-  blocked = guarded.guard.record().blocked;
+  const record = guarded.guard.record();
+  blocked = record.blocked;
+  // What the audit log would hold: one event per write the guard stopped.
+  for (const e of record.events) console.log(`guard ${e.action}: ${e.kind} ${e.kind === 'request' ? `${e.method} ${e.url}` : `"${e.label}"`}`);
 } finally {
   await client?.close().catch(() => {});
   await guarded.close().catch(() => {});
