@@ -1,9 +1,11 @@
 // playwright-write-guard/test: Playwright Test's `test` and `expect`, with every context guarded.
 //
 // The test's own context is guarded with `install` (which also locks context.request and
-// page.request under read-only). Everything else that could make a context, a request client
-// or a connection the guard cannot see is refused, in the worker, while a guarded test or hook
-// runs. Playwright's own creation of the test's context (and, under observe, of the request
+// page.request under read-only). Worker-level locks refuse the Playwright APIs that would make
+// a context, a request client or a connection the guard cannot see (newContext, newPage,
+// request.newContext, the global fetch, and the launch and connect family) while a guarded test
+// or hook runs. Nothing else is refused: Node's own http, https and net are not seen.
+// Playwright's own creation of the test's context (and, under observe, of the request
 // fixture) is the one exception, and the window that allows it is shut again straight after.
 
 import { test as base, expect } from '@playwright/test';

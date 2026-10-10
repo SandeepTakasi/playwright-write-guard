@@ -195,6 +195,15 @@ test.describe('observe', () => {
     });
   });
 
+  test.describe('the request fixture', () => {
+    test.use({ writeGuardConfig: { policy: 'observe', log: null } });
+
+    test('the request window closes after setup under observe', async ({ request, playwright }) => {
+      expect(typeof request.get).toBe('function');
+      await expect(playwright.request.newContext()).rejects.toThrow(/^write-guard: /);
+    });
+  });
+
   refusals();
 });
 
