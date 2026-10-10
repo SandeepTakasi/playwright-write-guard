@@ -3,19 +3,29 @@
 /** `read-only` blocks writes; `observe` records them and lets them through. */
 export type Policy = 'read-only' | 'observe';
 
-/** A request method a signature can name. `*` matches any method. */
-export type SigMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'OPTIONS' | '*';
+/**
+ * A request method a signature can name: `"*"` (any method) or a method name matching
+ * `^[A-Za-z][A-Za-z0-9-]*$` (for example `POST`, `REPORT` or `M-SEARCH`), compiled to upper
+ * case and compared with the request's method in upper case.
+ */
+export type SigMethod = string;
 
 /**
  * A request signature. `url` and `body` are regex sources, compiled with no flags
  * (case-sensitive) and tested unanchored against the full URL and the request body.
- * A signature with `body` never matches a request that has no body.
+ * A signature with `body` never matches a request that has no body. A signature with
+ * `headers` matches only when every named header is present and its value matches.
  */
 export interface Sig {
   method: SigMethod;
   url: string;
   /** Absent or `null`: the signature names no body. */
   body?: string | null;
+  /**
+   * Header name to a regex source. Names compare case-insensitively; values are compiled
+   * with no flags and tested unanchored. Absent or `null`: the signature names no headers.
+   */
+  headers?: Record<string, string> | null;
 }
 
 /** The raw config. Every key is optional; unknown keys are ignored. */
@@ -32,19 +42,27 @@ export interface Config {
     /** Class name prefixes; a control with a class starting with one is destructive. */
     icons?: string[];
   };
-  /** Default `true`: include the 23 built-in verbs in the text pattern. */
+  /**
+   * Default `true`: include the 11 built-in verbs in the text pattern: `save`, `delete`,
+   * `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `log out`, `sign out`, `logout`.
+   */
   defaultControls?: boolean;
   /** Default `"allow"`. */
   websockets?: 'allow' | 'block';
   /** JSONL audit log path, relative to the working directory. Default `"write-guard.jsonl"`; `null` turns it off. */
   log?: string | null;
+  /** Default `false`: when `true`, request events carry `body`, the first 500 characters of the request body. */
+  logBodies?: boolean;
 }
 
 export interface CompiledSig {
+  /** `"*"` or the method name in upper case. */
   method: SigMethod;
   url: RegExp;
   /** `null` when the signature names no body. */
   body: RegExp | null;
+  /** Header names in lower case; empty when the signature names no headers. */
+  headers: Array<{ name: string; value: RegExp }>;
 }
 
 /** What `compileConfig` returns: every default applied, every pattern compiled. */
@@ -58,6 +76,7 @@ export interface CompiledConfig {
   icons: string[];
   websockets: 'allow' | 'block';
   log: string | null;
+  logBodies: boolean;
 }
 
 export interface RequestInput {
@@ -65,6 +84,8 @@ export interface RequestInput {
   url: string;
   /** The request body; `null` or absent when it has none. */
   body?: string | null;
+  /** The request headers, names in any case (`decideRequest` lower-cases them); absent when it has none. */
+  headers?: Record<string, string>;
 }
 
 export interface RequestDecision {

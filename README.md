@@ -254,7 +254,8 @@ Every key is optional, and unknown keys are ignored:
   "controls": { "text": [], "icons": [] },
   "defaultControls": true,
   "websockets": "allow",
-  "log": "write-guard.jsonl"
+  "log": "write-guard.jsonl",
+  "logBodies": false
 }
 ```
 
@@ -265,16 +266,18 @@ Every key is optional, and unknown keys are ignored:
 | `writes` | list of Sig | `[]` | requests that are writes even when their method is GET, HEAD or OPTIONS |
 | `controls.text` | list of regex sources | `[]` | extra label patterns that make a control destructive |
 | `controls.icons` | list of class name prefixes | `[]` | a control with a class starting with one of these is destructive |
-| `defaultControls` | boolean | `true` | include the built-in verbs in the label pattern |
-| `websockets` | `"allow"` or `"block"` | `"allow"` | `block` refuses every WebSocket |
+| `defaultControls` | boolean | `true` | include the 11 built-in verbs (listed under Writes and controls) in the label pattern; `false` drops them |
+| `websockets` | `"allow"` or `"block"` | `"allow"` | `allow` records each WebSocket open and lets it connect; `block` refuses every WebSocket |
 | `log` | path or `null` | `"write-guard.jsonl"` | the JSONL audit log, relative to the process's working directory; `null` turns it off |
+| `logBodies` | boolean | `false` | add `body`, the first 500 characters of the request body, to request events (in `record()` and the log); off by default because bodies can hold credentials and personal data |
 
-A **Sig** (request signature) is `{ "method": M, "url": U, "body": B }`:
+A **Sig** (request signature) is `{ "method": M, "url": U, "body": B, "headers": H }`:
 
-- `method` is one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` or `*`. `*` matches any method; any other value matches that method exactly, compared with the request's method in upper case.
+- `method` is `"*"` or a method name: a string matching `^[A-Za-z][A-Za-z0-9-]*$` (for example `POST`, `delete`, `REPORT` or `M-SEARCH`), compiled to upper case. `*` matches any method; a method name matches that method exactly, compared with the request's method in upper case.
 - `url` is a regex source, compiled with no flags (case-sensitive) and tested, unanchored, against the full request URL. Use `^` and `$` to anchor it, and escape dots: `"^https://api[.]example[.]com/graphql$"`.
 - `body` is optional (absent or `null` means the Sig names no body): a regex source, compiled the same way and tested against the request body. A signature with a `body` never matches a request that has no body (a body that is `null` or absent).
-- A request matches a Sig when its method, its URL and (when the Sig has one) its body all match.
+- `headers` is optional (absent or `null` means the Sig names no headers): an object mapping a header name to a regex source, for example `{ "Next-Action": "^[0-9a-f]+$" }`. Header names compare case-insensitively (they are compiled to lower case). Each value is compiled with no flags and tested, unanchored, against the value of that header on the request. A Sig with `headers` matches a request only when every header it names is present on the request and its value matches.
+- A request matches a Sig when its method, its URL, (when the Sig has one) its body and (when the Sig names any) every named header all match.
 
 ### Writes and controls
 
@@ -282,11 +285,19 @@ A **Sig** (request signature) is `{ "method": M, "url": U, "body": B }`:
 
 **A control is destructive** when its label matches the label pattern, or it has a class starting with one of the `controls.icons` prefixes. The label pattern is the built-in verbs (unless `defaultControls` is `false`) plus every `controls.text` source, joined into one case-insensitive regex. The built-in verbs match as whole words, case-insensitive (`Save` and `Delete item` match, `Saved` does not):
 
-`save`, `delete`, `remove`, `publish`, `share`, `submit`, `send`, `archive`, `upload`, `import`, `rename`, `duplicate`, `update`, `confirm`, `pay`, `purchase`, `invite`, `reset`, `restore`, `approve`, `reject`, `log out`, `sign out`
+`save`, `delete`, `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `log out`, `sign out`, `logout`
 
 There are no built-in icons: icon libraries differ per app, so name yours in `controls.icons` (for example `"icon-trash"`). An empty label never matches the label pattern; with `defaultControls: false` and no `controls.text`, only icons can make a control destructive.
 
-In the page, the **control** for a click is the nearest ancestor of the click target (or the target itself) matching `button, a, [role=button], [role=menuitem], [role=link], [role=tab], input[type=submit], input[type=button], input[type=image], summary, [onclick], [tabindex]`, or the target when none does. For a form submit it is the submitter, or the form when there is none; for an Enter or Space keydown it is the focused element. Its **label** is the first non-empty, trimmed value of its `aria-label` attribute, its `innerText`, its `title` attribute and its `value`. Its **icons** are every class name on the control and on each of its descendants.
+In the page, a **control** is an element matching the control selector `button, a[href], [role=button], [role=menuitem], [role=link], [role=tab], input[type=submit], input[type=button], input[type=image]`. The page judges three events, and only when they have a control:
+
+- **Click:** the control is the first element of `event.composedPath()` that matches the control selector. The path runs from the click target outward and crosses open shadow roots. When no element on it matches, the click is not judged.
+- **Form submit:** the control is `event.submitter`. When there is none (as with `form.requestSubmit()` called without a submitter), it is the first element of the form's `form.elements` matching `button:not([type]), button[type=submit], input[type=submit], input[type=image]`. When there is none of those either, the submit is not judged.
+- **Enter or Space keydown:** judged only when `document.activeElement` itself matches the control selector, and that element is the control. A keydown in a text field, or with focus on any other element, is never judged.
+
+A control's **label** is the first non-empty, trimmed value of its `aria-label` attribute, its `innerText`, its `title` attribute and its `value`. When that is empty and the control is inside a shadow root, the label is the same rule applied to that shadow root's host (so `<x-btn>Delete</x-btn>`, whose shadow root holds a `<button>` with a `<slot>`, is labelled `Delete`). Its **icons** are every class name on the control and on each of its descendants.
+
+Not judged in the page, by design: anchors without `href`, `<input type=reset>`, `summary`, plain elements that have only an `onclick` attribute or a `tabindex` (rows, cards), and controls inside closed shadow roots (the path stops at the shadow host). The network layer still judges every request any of them sends.
 
 ### The decision core: `playwright-write-guard`
 
@@ -300,8 +311,23 @@ decideControl({ label: 'Delete item', icons: [] }, config);
 // { action: 'block', reason: '...' }
 ```
 
-- `compileConfig(raw)` validates a raw config (`null` and `undefined` mean `{}`), applies every default and compiles every pattern. On anything malformed it throws an `Error` whose message is `write-guard: <path>: <message>`, where `<path>` names the offending key the way the config spells it (`policy`, `allow[0].method`, `controls.text[2]`), or `config` for the whole value. Malformed means: a config that is not an object; a `policy`, `websockets` or Sig `method` outside its allowed values; `allow`, `writes`, `controls.text` or `controls.icons` that is not a list; a Sig that is not an object; a `url`, a `body` other than `null`, or a `controls.text` entry that is not a non-empty string or does not compile; a `controls.icons` entry that is not a non-empty string; `controls` that is not an object; `defaultControls` that is not a boolean; `log` that is neither a non-empty string nor `null`. The result is `{ policy, allow, writes, text, icons, websockets, log }`: `allow` and `writes` hold `{ method, url: RegExp, body: RegExp | null }`, `text` is the label pattern (`null` when there is none), and `icons` is `controls.icons`.
-- `decideRequest({ method, url, body }, compiled)` returns `{ action, reason }`. For a write, `action` is `"block"` under `read-only` and `"observe"` under `observe`; for anything else it is `"allow"`.
+- `compileConfig(raw)` validates a raw config (`null` and `undefined` mean `{}`), applies every default and compiles every pattern. On anything malformed it throws an `Error` whose message is `write-guard: <path>: <message>`, where `<path>` names the offending key the way the config spells it (`policy`, `allow[0].method`, `controls.text[2]`, `allow[0].headers.Next-Action`), or `config` for the whole value. Malformed means:
+  - a config that is not an object;
+  - a `policy` or `websockets` outside its allowed values;
+  - a Sig `method` that is neither `"*"` nor a string matching `^[A-Za-z][A-Za-z0-9-]*$`, which throws `write-guard: <path>.method: must be "*" or a method name` (for example `write-guard: allow[0].method: must be "*" or a method name`);
+  - `allow`, `writes`, `controls.text` or `controls.icons` that is not a list;
+  - a Sig that is not an object;
+  - a `url`, a `body` other than `null`, or a `controls.text` entry that is not a non-empty string or does not compile;
+  - a Sig `headers` other than `null` that is not an object, which throws `write-guard: <path>.headers: must be an object` (for example `write-guard: allow[0].headers: must be an object`);
+  - a `headers` value that is not a non-empty string or does not compile, whose path is the header name as written in the config (for example `write-guard: allow[0].headers.Next-Action: <message>`);
+  - a `controls.icons` entry that is not a non-empty string;
+  - `controls` that is not an object;
+  - `defaultControls` that is not a boolean;
+  - `logBodies` that is not a boolean, which throws `write-guard: logBodies: must be a boolean`;
+  - `log` that is neither a non-empty string nor `null`.
+
+  The result is `{ policy, allow, writes, text, icons, websockets, log, logBodies }`: `allow` and `writes` hold `{ method, url: RegExp, body: RegExp | null, headers: Array<{ name: string, value: RegExp }> }`, where `method` is `"*"` or the method name in upper case and `headers` holds one entry per named header, its `name` in lower case (empty when the Sig names none); `text` is the label pattern (`null` when there is none); `icons` is `controls.icons`; `logBodies` is `false` unless the config sets it to `true`.
+- `decideRequest({ method, url, body, headers }, compiled)` returns `{ action, reason }`. `body` is `null` or absent when the request has none. `headers` is an object of header name to value, names in any case (`decideRequest` lower-cases them itself), absent when the request has none, in which case no Sig that names headers matches. For a write, `action` is `"block"` under `read-only` and `"observe"` under `observe`; for anything else it is `"allow"`.
 - `decideControl({ label, icons }, compiled)` returns `{ action, reason }`. For a destructive control, `action` is `"block"` under `read-only` and `"observe"` under `observe`; for anything else it is `"allow"`.
 - `reason` is a short human-readable explanation; its wording is not part of the API.
 
@@ -311,11 +337,25 @@ These three functions reference nothing outside their own arguments, because the
 
 `install(context, config?)` guards one Playwright `BrowserContext` and returns `Promise<GuardHandle>`. It compiles `config` (default `{}`) with `compileConfig`, so a malformed config throws before anything is installed. A second call on the same context returns the first call's handle and ignores its own `config`. It:
 
-1. Registers one catch-all `context.route` before anything else, and judges each request exactly once with `decideRequest`, however many route handlers see it. An allowed or observed request falls back to the next handler and then to the network.
-2. Wraps `context.route` and the `route` of every page in the context, present and future, so the guard judges each request before any handler registered later, and a later handler that calls `continue()` cannot let a blocked request past. The wrapped `unroute` and `unrouteAll` remove only the caller's own handlers, never the guard's. The route a later handler receives also judges its overrides again: its `continue(options)`, `fallback(options)` and `fetch(options)` are judged as the request they would make when `options` changes the method, URL or body (calls with no options, or headers only, are not judged again, because the original was already judged). Under read-only, a write override makes `continue` and `fallback` abort the request with `'blockedbyclient'` (not the 403 page, even for a document) and makes `fetch` reject with `write-guard: route.fetch of <METHOD> <URL> is refused under read-only`. Under observe the override proceeds. Either way it is recorded once as a `request` event with the effective method and URL, and not counted in `routed_requests`. This applies in the fixture, the `initPage` entry and a direct `install`; in launcher mode it covers only the launcher's own process (see below).
-3. On `block`: a request whose resource type is `document` is fulfilled with status 403, content type `text/html; charset=utf-8`, and a short HTML page reading `write-guard blocked <METHOD> <URL>` (HTML-escaped), so a blocked navigation shows why instead of a browser error page; any other request is aborted with `'blockedbyclient'`, which the page sees as a network error.
-4. Under `websockets: "block"`, refuses every WebSocket under either policy with `context.routeWebSocket`: the socket is closed without connecting to the server and recorded as a `request` event with `action: "block"` and the socket's `url` (no `method`). It is not counted in `routed_requests`.
-5. Adds an init script that runs before any page script, with capture-phase `click`, `submit` and `keydown` (Enter or Space) listeners on `window` that judge the control with `decideControl`. Under `read-only` a destructive control's event is stopped (`preventDefault` and `stopImmediatePropagation`), so the app never sees it; under `observe` it goes through. Either way the page reports the event through the binding `__writeGuardReport`, which the script captures before any page script can replace it.
+1. Registers one catch-all `context.route`, matching every URL, before anything else. Page handlers run before context handlers, and context handlers run in reverse order of registration, so in the guard's process the catch-all is the last handler a request reaches.
+2. Wraps `context.route` and the `route` of every page in the context, present and future. A handler registered through them receives every request, blocked writes included, and gets a route on which:
+   - `continue(options)` and `fetch(options)` are egress points, judged as in step 3;
+   - `fallback(options)` is not judged: it passes the request to the next handler with its overrides applied, so the next handler's `route.request()` reflects them, and they are judged at the egress where the request finally leaves;
+   - `fulfill` and `abort` are not judged and record nothing, so a test can mock a write by fulfilling it.
+
+   The wrapped `unroute` and `unrouteAll` remove only the caller's own handlers, never the guard's. This applies in the fixture, the `initPage` entry and a direct `install`; in launcher mode it covers only the launcher's own process (see below).
+3. Judges each request at **egress**, the point where it would leave the browser. There are three egress points: (a) the guard's catch-all, reached when every handler before it fell back; (b) a caller's `route.continue(options)`; (c) a caller's `route.fetch(options)`. Each egress judges the effective request with `decideRequest`:
+   - For each of method, URL and body, the effective value is the one in `options` when given, else the request's as it reached that point (`route.request()`, which reflects earlier `fallback` overrides). A `postData` Buffer is read as UTF-8 and any other non-string `postData` as its JSON encoding; a body that cannot be decoded is judged as none. The effective method is upper-cased.
+   - Headers are a whole set, never merged: the effective headers are `options.headers` when given (Playwright replaces the full set), else `route.request().headers()`, with names lower-cased. The event's `contentType` is the effective `content-type` header.
+   - On `block`: (a) and (b) fulfill a request whose resource type is `document` with status 403, content type `text/html; charset=utf-8`, and a short HTML page reading `write-guard blocked <METHOD> <URL>` (the effective method and URL, HTML-escaped), so a blocked navigation shows why instead of a browser error page, and abort any other request with `'blockedbyclient'`, which the page sees as a network error; (c) rejects with `write-guard: route.fetch of <METHOD> <URL> is refused under read-only`, with the effective method and URL.
+   - On `allow` or `observe` (`observe` records the event first): (a) proceeds with `route.fallback()`, never `continue()`, so handlers registered behind it (a launcher client's `context.route`) still run; (b) and (c) call Playwright's own `continue` or `fetch` with the same options.
+   - Each egress attempt records at most one event (none when the request is allowed). `routed_requests` counts each request once, at its first egress; a request a caller fulfills or aborts without reaching an egress is not counted.
+4. Registers one `context.routeWebSocket`, matching every URL, under both `websockets` settings and either policy:
+   - Under `"allow"`, each socket is recorded as `{ kind: "websocket", action: "open", url, at }` and connected with `ws.connectToServer()`. Its messages are not judged or logged.
+   - Under `"block"`, each socket is closed with code 1008 without connecting to the server, and recorded as a `request` event with `action: "block"` and the socket's `url` (no `method`).
+
+   No socket counts in `routed_requests`, and a `websocket` event counts in neither `blocked` nor `observed`. Because the guard always routes sockets: under both settings Playwright replaces the page's `WebSocket` with its routed implementation; in launcher mode an attached client cannot register its own `routeWebSocket` (Playwright throws `Another client is already routing WebSockets`); in the guard's process a caller's own `routeWebSocket` registered later takes precedence, and then no open is recorded and `"block"` does not refuse that socket; sockets opened by dedicated or shared workers are not routed, so they are neither recorded nor blocked.
+5. Adds an init script that runs before any page script, with capture-phase `click`, `submit` and `keydown` (Enter or Space) listeners on `window` that find the control as described under Writes and controls and judge it with `decideControl`. Under `read-only` a destructive control's event is stopped (`preventDefault` and `stopImmediatePropagation`), so the app never sees it, and the page calls its original `console.warn`, which the script captures before any page script runs, with exactly `write-guard refused "<label>": <reason>`, where `<label>` is the control's label cut to 120 characters and `<reason>` is the reason `decideControl` returned. Under `observe` the event goes through and nothing is written to the console. Either way the page reports the event through the binding `__writeGuardReport`, which the script captures before any page script can replace it.
 6. Under `read-only`, dismisses every dialog (`alert`, `confirm`, `prompt`, `beforeunload`) on every page, so a native confirmation before a delete is declined.
 7. Under `read-only`, replaces `context.request` and the `request` of every page, present and future, with a proxy whose send methods (`fetch`, `get`, `post`, `put`, `patch`, `delete`, `head`) throw `write-guard: <method> through APIRequestContext is refused under read-only` (for example `write-guard: post through APIRequestContext is refused under read-only`). The other properties stay readable. This lock exists only in the process that called `install`.
 
@@ -323,18 +363,23 @@ If the binding `__writeGuardReport` is already registered on the context, anothe
 
 `install` cannot change how the context was created: create it with `serviceWorkers: 'block'`, or a service worker can send requests the guard never sees. The fixture, the launcher and the `initPage` config below all do.
 
-**Events.** Every blocked or observed write is one event:
+**Events.** Every blocked or observed write is one event, and so is every WebSocket opened under `websockets: "allow"`:
 
 ```ts
-{ kind: 'request' | 'control', action: 'block' | 'observe', reason: string,
-  method?: string, url?: string, label?: string, at: string }
+{ kind: 'request', action: 'block' | 'observe', reason: string,
+  method?: string, url: string, contentType?: string, body?: string, at: string }
+{ kind: 'control', action: 'block' | 'observe', reason: string, label: string, at: string }
+{ kind: 'websocket', action: 'open', url: string, at: string }
 ```
 
-A request event carries `method` and `url`; a control event carries `label` (trimmed, at most 120 characters) and neither `method` nor `url`. `at` is an ISO 8601 timestamp. Allowed requests and controls produce no event.
+- A request event carries the effective `method` (upper case) and `url`; a socket refused under `websockets: "block"` carries its `url` and no `method`. It carries `contentType` when the effective request has a `content-type` header, and, only with `logBodies: true`, `body`: the first 500 characters of the effective request body, when the request has one.
+- A control event carries `label` (trimmed, at most 120 characters) and none of the request fields.
+- A websocket event carries `url` and no `reason`.
+- `at` is an ISO 8601 timestamp. Allowed requests and controls produce no event.
 
 **The handle.**
 
-- `record()` returns `{ installed: true, policy, routed_requests, blocked, observed, events }`: `routed_requests` counts the requests the guard judged, each once; `blocked` and `observed` count request and control events alike.
+- `record()` returns `{ installed: true, policy, routed_requests, blocked, observed, events }`: `routed_requests` counts the requests the guard judged at egress, each once, at its first egress, and no WebSockets; `blocked` and `observed` count request and control events by their `action`, and `websocket` events count in neither.
 - `close()` resolves after the last pending log append and returns the final `record()`. The guard stays active until the context closes.
 
 **The audit log.** When `config.log` is a path, each event is appended to that file as one JSON line, as it happens. The path is relative to the process's working directory; the file is created when missing and never truncated.
@@ -398,7 +443,7 @@ Without those entries the agent can remove the guard.
 
 `startGuardedBrowser({ config, headless = true, host = '127.0.0.1', port = 0, title = 'write-guard' })` returns `Promise<{ wsEndpoint, browser, context, guard, close() }>`. It launches Chromium with `playwright-core`, creates one context with `serviceWorkers: 'block'`, guards it with `install(context, config)` (`config` defaults to `loadConfig()`), and calls `browser.bind(title, { host, port })`; `wsEndpoint` is the `endpoint` that returns, `ws://<host>:<port>/<id>` (`port: 0` lets the OS pick a free port). `guard` is the install handle. `close()` waits for `guard.close()`, then closes the context and the browser.
 
-A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded context as `contexts()[0]`. The guard runs in the launcher's process, so the client's own `unroute` and `unrouteAll()` cannot remove it, and a `page.route` handler that calls `continue()` without overrides is still judged (page handlers run before the owner's context route). New tabs the client opens in that context are guarded. A client's `context.route` handler runs after the guard, in the client's process, so its `continue()` or `fallback()` overrides are not judged again, and its `route.fetch()` is not seen; see "What it cannot see" below.
+A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded context as `contexts()[0]`. The guard runs in the launcher's process, so the client's own `unroute` and `unrouteAll()` cannot remove it, and a `page.route` handler that calls `continue()` without overrides is still judged (page handlers run before the owner's context route). New tabs the client opens in that context are guarded. A client's `page.route` handler can `fulfill` or `abort` a write, so it can mock one. A client's `context.route` handler runs after the guard's catch-all, in the client's process: it receives only requests the catch-all already judged and let through, so it cannot mock a blocked write, its `continue()` or `fallback()` overrides are not judged again, and its `route.fetch()` is not seen; see "What it cannot see" below. The client cannot register its own `routeWebSocket`, because the guard already routes every WebSocket (Playwright throws `Another client is already routing WebSockets`).
 
 The command does the same from a shell:
 

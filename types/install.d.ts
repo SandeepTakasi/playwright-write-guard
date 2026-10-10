@@ -3,22 +3,50 @@
 import type { BrowserContext } from 'playwright-core';
 import type { Config, Policy } from './core.js';
 
-/** One write the guard blocked or observed. Request events carry `method` and `url`; control events carry `label`. */
-export interface GuardEvent {
-  kind: 'request' | 'control';
+/** A write the guard blocked or observed at egress, or a WebSocket refused under `websockets: "block"`. */
+export interface RequestEvent {
+  kind: 'request';
   action: 'block' | 'observe';
   reason: string;
+  /** The effective method, upper case. Absent for a refused WebSocket. */
   method?: string;
-  url?: string;
-  label?: string;
+  /** The effective URL, or the refused WebSocket's URL. */
+  url: string;
+  /** The effective `content-type` header, when the request has one. */
+  contentType?: string;
+  /** Only with `logBodies: true`: the first 500 characters of the effective body, when the request has one. */
+  body?: string;
   /** ISO 8601 timestamp. */
   at: string;
 }
 
+/** A destructive control the page blocked or observed. */
+export interface ControlEvent {
+  kind: 'control';
+  action: 'block' | 'observe';
+  reason: string;
+  /** Trimmed, at most 120 characters. */
+  label: string;
+  /** ISO 8601 timestamp. */
+  at: string;
+}
+
+/** A WebSocket opened under `websockets: "allow"`. Counts in neither `blocked` nor `observed`. */
+export interface WebSocketEvent {
+  kind: 'websocket';
+  action: 'open';
+  url: string;
+  /** ISO 8601 timestamp. */
+  at: string;
+}
+
+/** One event the guard recorded. */
+export type GuardEvent = RequestEvent | ControlEvent | WebSocketEvent;
+
 export interface GuardRecord {
   installed: true;
   policy: Policy;
-  /** Requests the guard judged, each counted once. */
+  /** Requests the guard judged at egress, each counted once, at its first egress. WebSockets are not counted. */
   routed_requests: number;
   /** Request and control events with `action: "block"`. */
   blocked: number;
