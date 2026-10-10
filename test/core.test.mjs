@@ -276,6 +276,15 @@ test('header signatures match case-insensitive names and need every header', () 
   assert.equal(t({ A: '1' }), 'block');
 });
 
+test('a header signature needs every named header', () => {
+  const c = cfg({ allow: [{ method: 'POST', url: '/x$', headers: { 'x-a': '.' } }] });
+  const r = (headers) => decideRequest({ method: 'POST', url: 'https://a.test/x', headers }, c).action;
+  assert.equal(r(undefined), 'block', 'no headers');
+  assert.equal(r({}), 'block', 'no headers');
+  assert.equal(r({ 'x-b': 'anything' }), 'block', 'only an unrelated header');
+  assert.equal(r({ 'x-a': 'anything' }), 'allow');
+});
+
 test('a header value regex is case-sensitive and unanchored', () => {
   const c = cfg({ writes: [{ method: 'GET', url: '/x$', headers: { 'x-t': 'drop' } }] });
   const r = (v) => decideRequest({ method: 'GET', url: 'https://a.test/x', headers: { 'X-T': v } }, c).action;
