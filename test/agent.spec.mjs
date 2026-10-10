@@ -410,6 +410,23 @@ test.describe('the command', () => {
       expect(r.stderr).toContain('usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]');
     }
   });
+
+  test('an invalid --port prints the usage line', () => {
+    const r = spawnSync(process.execPath, [BIN, '--port', 'abc'], { encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]');
+  });
+
+  test('a startup failure exits 1 with its message', ({}, testInfo) => {
+    // The config file does not exist, so loadConfig throws before the browser starts.
+    const env = { ...process.env };
+    delete env.WRITE_GUARD_CONFIG;
+    delete env.WRITE_GUARD_POLICY;
+    const missing = testInfo.outputPath('missing.json');
+    const r = spawnSync(process.execPath, [BIN, '--config', missing], { encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL', env });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/^write-guard:/);
+  });
 });
 
 test.describe('the initPage entry', () => {
