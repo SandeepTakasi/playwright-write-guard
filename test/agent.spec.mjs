@@ -4,7 +4,7 @@
 
 import { test, expect, chromium } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { startGuardedBrowser } from '../src/browser.mjs';
 import initPage from '../src/init-page.mjs';
@@ -144,6 +144,30 @@ test.describe('the launcher', () => {
   });
 });
 
+test('the launcher\'s log is complete after close', async ({}, testInfo) => {
+  const log = testInfo.outputPath('guard.log');
+  const g = await startGuardedBrowser({ port: 0, config: { log } });
+  const client = await chromium.connect(g.wsEndpoint);
+  let closed = false;
+  try {
+    const context = client.contexts()[0];
+    await serve(context);
+    const page = await open(context);
+    // Back to back, so appends are still pending when close() is called.
+    await page.evaluate(() => Promise.all(['POST', 'PUT', 'DELETE', 'PATCH', 'POST'].map((m) => fetch('/api/items', { method: m, body: '{}' }).catch(() => {}))));
+    const { events } = g.guard.record();
+    expect(events.length).toBeGreaterThanOrEqual(5);
+    await g.close();
+    closed = true;
+    const lines = readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(lines).toHaveLength(events.length);
+    expect(lines.every((l) => l.action === 'block')).toBe(true);
+  } finally {
+    await client.close().catch(() => {});
+    if (!closed) await g.close();
+  }
+});
+
 test.describe('the command', () => {
   test('prints the endpoint and how to attach, and exits 0 on SIGTERM', async ({}, testInfo) => {
     const config = testInfo.outputPath('config.json');
@@ -165,6 +189,37 @@ test.describe('the command', () => {
 
       const client = await chromium.connect(endpoint);
       expect(client.contexts()).toHaveLength(1);
+      await client.close();
+    } finally {
+      child.kill('SIGTERM');
+    }
+    expect(await exited).toEqual({ code: 0, signal: null });
+  });
+
+  test('the command reads the config named by --config', async ({}, testInfo) => {
+    const config = testInfo.outputPath('observe.json');
+    writeFileSync(config, JSON.stringify({ policy: 'observe', log: null }));
+    const env = { ...process.env };
+    delete env.WRITE_GUARD_CONFIG;
+    delete env.WRITE_GUARD_POLICY;
+    const child = spawn(process.execPath, [BIN, '--config', config, '--port', '0'], { stdio: ['ignore', 'pipe', 'pipe'], env });
+    const exited = new Promise((done) => child.on('exit', (code, signal) => done({ code, signal })));
+    try {
+      let out = '';
+      child.stdout.setEncoding('utf8');
+      await new Promise((done, fail) => {
+        child.stdout.on('data', (d) => { out += d; if (/^endpoint: .*\n/m.test(out)) done(); });
+        child.on('exit', () => fail(new Error(`exited early: ${out}`)));
+      });
+      const endpoint = out.match(/^endpoint: (ws:\/\/127[.]0[.]0[.]1:\d+\/\S+)$/m)?.[1];
+      expect(endpoint).toBeTruthy();
+
+      const client = await chromium.connect(endpoint);
+      const server = await serve(client.contexts()[0]);
+      const page = await open(client.contexts()[0]);
+      // Under the default read-only this POST is blocked and never reaches the client's route.
+      expect(await send(page, 'POST')).toBe(SERVED);
+      expect(server.writes()).toEqual(['POST /api/items']);
       await client.close();
     } finally {
       child.kill('SIGTERM');
