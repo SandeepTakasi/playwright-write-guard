@@ -105,6 +105,15 @@ test.describe('read-only', () => {
     expect(server.writes()).toEqual([]);
   });
 
+  test('a test can mock a write with page.route', async ({ page }) => {
+    const server = await serve(page, ACT(`fetch('/api/items', { method: 'POST', body: '{}' }).then((r) => r.text()).then(done, () => done('failed'));`));
+    // The test's own route answers the write, so it is a mock and never the real server.
+    await page.route('**/api/items', (route) => route.fulfill({ status: 201, contentType: 'application/json', body: '{"mocked":true}' }));
+    await page.click('#go');
+    await expect(page.locator('#state')).toHaveText('{"mocked":true}');
+    expect(server.writes()).toEqual([]);
+  });
+
   test('an XHR PUT is blocked and never reaches the server', async ({ page }) => {
     const server = await serve(page, ACT(`const x = new XMLHttpRequest(); x.open('PUT', '/api/items/1'); x.onload = () => done('reached'); x.onerror = () => done('failed'); x.send('{}');`));
     await page.click('#go');

@@ -4,6 +4,8 @@
 
 import { test, expect, chromium } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +94,22 @@ test.describe('the launcher', () => {
     expect(launcher.guard.record()).toMatchObject({ blocked: 1 });
   });
 
+  test('a client page.route continue still reaches the guard', async () => {
+    const server = await serve(context);
+    const page = await open(context);
+    // The route turns the page's GET into a DELETE. Its continue() passes the overridden request
+    // on, and the guard judges what would actually be sent.
+    await page.route('**/api/**', (route) => route.continue({ method: 'DELETE' }));
+    const failed = page.waitForEvent('requestfailed');
+
+    expect(await send(page, 'GET')).toBe('network error');
+    expect((await failed).failure().errorText).toMatch(/BLOCKED_BY_CLIENT/);
+    expect(server.writes()).toEqual([]);
+    expect(server.seen).toEqual(['GET /']);
+    expect(launcher.guard.record()).toMatchObject({ blocked: 1 });
+    expect(launcher.guard.record().events[0]).toMatchObject({ kind: 'request', action: 'block', method: 'DELETE', url: `${APP}/api/items` });
+  });
+
   test('a client\'s unrouteAll() leaves the guard in place', async () => {
     await serve(context);
     const page = await open(context);
@@ -143,6 +161,56 @@ test.describe('the launcher', () => {
     await expect.poll(() => launcher.guard.record().blocked).toBe(1);
     expect(launcher.guard.record().events[0]).toMatchObject({ kind: 'control', action: 'block', label: 'Delete item' });
   });
+});
+
+// A page and a text-frame echo socket on one 127.0.0.1 port: an https page could not open this
+// ws:// socket (mixed content), so the page has to come from the same http origin.
+async function serveEcho() {
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><p>echo</p>');
+  });
+  server.on('upgrade', (req, socket) => {
+    socket.on('error', () => {});
+    const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    // One masked client text frame of under 126 bytes is all the test sends; it comes back unmasked.
+    socket.on('data', (frame) => {
+      if ((frame[0] & 0x0f) === 8) return socket.end();
+      const len = frame[1] & 0x7f;
+      const mask = frame.subarray(2, 6);
+      const text = Buffer.from(frame.subarray(6, 6 + len).map((b, i) => b ^ mask[i % 4]));
+      socket.write(Buffer.concat([Buffer.from([0x81, len]), text]));
+    });
+  });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  return { server, origin: `http://127.0.0.1:${server.address().port}` };
+}
+
+test('the launcher records a websocket open', async () => {
+  const { server, origin } = await serveEcho();
+  const g = await startGuardedBrowser({ port: 0, config: { log: null } });
+  const client = await chromium.connect(g.wsEndpoint);
+  try {
+    const page = await client.contexts()[0].newPage();
+    await page.goto(`${origin}/`);
+    const url = `${origin.replace('http', 'ws')}/echo`;
+    const echoed = await page.evaluate((u) => new Promise((resolve, reject) => {
+      const ws = new WebSocket(u);
+      ws.onopen = () => ws.send('hello');
+      ws.onmessage = (e) => resolve(e.data);
+      ws.onerror = () => reject(new Error('socket failed'));
+    }), url);
+
+    expect(echoed).toBe('hello');
+    const { events } = g.guard.record();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({ kind: 'websocket', action: 'open', url, at: expect.any(String) });
+  } finally {
+    await client.close().catch(() => {});
+    await g.close();
+    await new Promise((done) => { server.close(done); server.closeAllConnections(); });
+  }
 });
 
 test('the launcher\'s log is complete after close', async ({}, testInfo) => {
