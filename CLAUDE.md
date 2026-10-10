@@ -19,8 +19,8 @@ Guide for contributors and coding agents working in this repository.
 ## Tests
 
 - Every guard rule needs a test that fails when the rule is reverted or weakened. Check a new rule by breaking it on purpose in a scratch copy and watching a test fail; a green suite alone proves nothing.
-- Tests never reach the network: serve every page and API with routes on `https://app.test`. `context.request` and `page.request` do not pass through context routes (Playwright 1.64), so never send to `app.test` through an unlocked request client.
-- In-page control tests attach the app's handlers with `addEventListener`. An `onclick` attribute makes the element match `[onclick]` in the control selector and hides whether the other selector members work.
+- Tests never reach the network: serve every page and API with routes on `https://app.test`. `context.request` and `page.request` do not pass through context routes (Playwright 1.64), so never send to `app.test` through an unlocked request client. A route registered after the guard that fulfills requests is a mock, not the server: count writes on a real 127.0.0.1 server or a route registered before `install`.
+- In-page control tests attach the app's handlers with `addEventListener`. A plain element with only an `onclick` attribute is no longer a control, so a test written with `onclick` attributes on non-control elements tests nothing.
 - A test that spawns the command gives it a timeout, so a regression that keeps the command running fails the test instead of hanging the run.
 - The launcher's title test reads Playwright's internal `PWTEST_SERVER_REGISTRY` directory. After a Playwright upgrade, check it still exists before trusting that test.
 
