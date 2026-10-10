@@ -1,10 +1,11 @@
 // playwright-write-guard/install: guard one Playwright BrowserContext.
 //
-// The network side judges every request in a catch-all context route registered first, and
-// wraps every route a caller registers later so the guard judges before the caller's handler
-// can continue a request. The page side is an init script built from the decision core's own
-// source, with capture-phase listeners that refuse destructive controls before the app sees
-// them. No playwright import: everything goes through the context it is handed.
+// The network side judges each request at egress, where it would leave the browser: a
+// catch-all context route registered first (so it runs last), and the continue and fetch of
+// every route a caller registers later. A caller's handler sees every request and may fulfill
+// or abort it. The page side is an init script built from the decision core's own source,
+// with capture-phase listeners that refuse destructive controls before the app sees them.
+// No playwright import: everything goes through the context it is handed.
 
 import { existsSync, promises as fsp, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -40,7 +41,8 @@ async function setup(context, raw, cfg) {
   const emit = (event) => {
     const e = { ...event, at: new Date().toISOString() };
     events.push(e);
-    counts[e.action === 'block' ? 'blocked' : 'observed']++;
+    if (e.action === 'block') counts.blocked++;
+    else if (e.action === 'observe') counts.observed++;
     if (logPath) {
       const line = `${JSON.stringify(e)}\n`;
       pending = pending.then(() => fsp.appendFile(logPath, line))
@@ -59,58 +61,59 @@ async function setup(context, raw, cfg) {
     throw err;
   }
 
-  // Each request is judged once, however many handlers see it. True means pass it on.
-  const decided = new WeakSet();
-  const judge = async (route) => {
+  // Judges the request as it would leave through `kind` ('catch-all', 'continue' or 'fetch'):
+  // each of method, URL and body from `options` when given, else as the request reached this
+  // point (route.request() reflects earlier fallback overrides). Headers are a whole set,
+  // never merged, as Playwright replaces them. Then blocks it or lets it proceed.
+  const counted = new WeakSet();
+  const egress = async (route, options, kind) => {
     const req = route.request();
-    if (decided.has(req)) return true;
-    decided.add(req);
-    counts.routed++;
-    const method = req.method();
-    const url = req.url();
+    const o = options ?? {};
+    const method = String(o.method || req.method()).toUpperCase();
+    const url = o.url || req.url();
+    const p = o.postData;
     let body = null;
-    try { body = req.postData(); } catch { /* an undecodable body is judged as none */ }
-    const v = decideRequest({ method, url, body }, cfg);
-    if (v.action === 'allow') return true;
-    emit({ kind: 'request', action: v.action, reason: v.reason, method, url });
-    if (v.action === 'observe') return true;
-    if (req.resourceType() === 'document') {
-      await route.fulfill({ status: 403, contentType: 'text/html; charset=utf-8', body: blockedPage(method, url) });
-    } else {
-      await route.abort('blockedbyclient');
-    }
-    return false;
-  };
+    if (p != null) body = typeof p === 'string' ? p : Buffer.isBuffer(p) ? p.toString('utf8') : JSON.stringify(p);
+    else try { body = req.postData(); } catch { /* an undecodable body is judged as none */ }
+    const headers = {};
+    for (const [k, val] of Object.entries(o.headers || req.headers())) headers[k.toLowerCase()] = String(val);
+    if (!counted.has(req)) { counted.add(req); counts.routed++; }
 
-  // A caller handler's continue, fallback or fetch overrides are judged as the request they
-  // make; one the original already matches was judged above. True means let it proceed.
-  const judgeOverride = (route, options = {}) => {
-    const req = route.request();
-    let original = null;
-    try { original = req.postData(); } catch { /* an undecodable body is judged as none */ }
-    const p = options.postData;
-    const body = p == null ? original : typeof p === 'string' ? p : Buffer.isBuffer(p) ? p.toString('utf8') : JSON.stringify(p);
-    const method = String(options.method || req.method()).toUpperCase();
-    const url = options.url || req.url();
-    if (method === req.method() && url === req.url() && body === original) return { pass: true };
-    const v = decideRequest({ method, url, body }, cfg);
-    if (v.action !== 'allow') emit({ kind: 'request', action: v.action, reason: v.reason, method, url });
-    return { pass: v.action !== 'block', method, url };
+    const v = decideRequest({ method, url, body, headers }, cfg);
+    if (v.action !== 'allow') {
+      emit({
+        kind: 'request', action: v.action, reason: v.reason, method, url,
+        ...(headers['content-type'] === undefined ? {} : { contentType: headers['content-type'] }),
+        ...(cfg.logBodies && body != null ? { body: body.slice(0, 500) } : {}),
+      });
+    }
+    if (v.action === 'block') {
+      if (kind === 'fetch') throw new Error(`write-guard: route.fetch of ${method} ${url} is refused under read-only`);
+      if (req.resourceType() === 'document') {
+        return route.fulfill({ status: 403, contentType: 'text/html; charset=utf-8', body: blockedPage(method, url) });
+      }
+      return route.abort('blockedbyclient');
+    }
+    // fallback, never continue, so handlers registered behind the catch-all still run.
+    return kind === 'catch-all' ? route.fallback() : route[kind](options);
   };
 
   // A predicate, not a glob, so no caller's unroute(url) can name it.
-  await context.route(() => true, async (route) => { if (await judge(route)) await route.fallback(); });
+  await context.route(() => true, (route) => egress(route, undefined, 'catch-all'));
 
-  if (cfg.websockets === 'block') {
-    await context.routeWebSocket(() => true, async (ws) => {
+  await context.routeWebSocket(() => true, async (ws) => {
+    if (cfg.websockets === 'block') {
       emit({ kind: 'request', action: 'block', reason: 'websockets is "block": every WebSocket is refused', url: ws.url() });
       await ws.close({ code: 1008, reason: 'write-guard' }).catch(() => {});
-    });
-  }
+    } else {
+      emit({ kind: 'websocket', action: 'open', url: ws.url() });
+      ws.connectToServer();
+    }
+  });
 
   await context.addInitScript({ content: pageScript(raw) });
 
-  patchRoutes(context, judge, judgeOverride);
+  patchRoutes(context, egress);
   if (cfg.policy === 'read-only') {
     lockRequest(context);
     // The context's dialog event is emitted before any page's, so this runs ahead of every
@@ -118,7 +121,7 @@ async function setup(context, raw, cfg) {
     context.on('dialog', (d) => d.dismiss().catch(() => {}));
   }
   const onPage = (page) => {
-    patchRoutes(page, judge, judgeOverride);
+    patchRoutes(page, egress);
     if (cfg.policy === 'read-only') lockRequest(page);
   };
   for (const p of context.pages()) onPage(p);
@@ -139,37 +142,28 @@ const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const blockedPage = (method, url) => `<!doctype html><html><head><meta charset="utf-8"><title>write-guard</title></head>`
   + `<body><p>write-guard blocked ${escapeHtml(method)} ${escapeHtml(url)}</p></body></html>`;
 
-// The route a caller's handler gets: continue, fallback and fetch judge their overrides first,
-// and everything else is the original Route.
-function judgedRoute(r, judgeOverride) {
+// The route a caller's handler gets: continue and fetch are egress points, judged first, and
+// everything else (fulfill, abort, fallback) is the original Route's.
+function judgedRoute(r, egress) {
   return new Proxy(r, {
     get(obj, prop) {
-      if (prop === 'continue' || prop === 'fallback') {
-        return async (options) => (judgeOverride(obj, options).pass ? obj[prop](options) : obj.abort('blockedbyclient'));
-      }
-      if (prop === 'fetch') {
-        return async (options) => {
-          const v = judgeOverride(obj, options);
-          if (!v.pass) throw new Error(`write-guard: route.fetch of ${v.method} ${v.url} is refused under read-only`);
-          return obj.fetch(options);
-        };
-      }
+      if (prop === 'continue' || prop === 'fetch') return async (options) => egress(obj, options, prop);
       const v = Reflect.get(obj, prop, obj);
       return typeof v === 'function' ? v.bind(obj) : v;
     },
   });
 }
 
-// Every handler a caller registers asks the guard first; unroute and unrouteAll remove only
+// Every handler a caller registers gets a judged route; unroute and unrouteAll remove only
 // the caller's own handlers.
-function patchRoutes(target, judge, judgeOverride) {
+function patchRoutes(target, egress) {
   const route = target.route.bind(target);
   const unroute = target.unroute.bind(target);
   const tracked = [];
   const sameUrl = (a, b) => a === b
     || (a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags);
   target.route = (url, handler, options) => {
-    const wrapped = async (r, request) => { if (await judge(r)) return handler(judgedRoute(r, judgeOverride), request); };
+    const wrapped = (r, request) => handler(judgedRoute(r, egress), request);
     tracked.push({ url, handler, wrapped });
     // The returned disposable calls target.unroute(url, wrapped), which lands below.
     return route(url, wrapped, options);
@@ -212,13 +206,21 @@ function pageScript(raw) {
   const bind = window.${BINDING};
   const preventDefault = Function.prototype.call.bind(Event.prototype.preventDefault);
   const stopImmediatePropagation = Function.prototype.call.bind(Event.prototype.stopImmediatePropagation);
+  const warn = console.warn.bind(console);
   const report = (e) => { try { Promise.resolve(bind(e)).catch(() => {}); } catch (_) {} };
-  const CONTROL = 'button, a, [role=button], [role=menuitem], [role=link], [role=tab], input[type=submit], input[type=button], input[type=image], summary, [onclick], [tabindex]';
-  const labelOf = (el) => {
+  const CONTROL = 'button, a[href], [role=button], [role=menuitem], [role=link], [role=tab], input[type=submit], input[type=button], input[type=image]';
+  const SUBMIT = 'button:not([type]), button[type=submit], input[type=submit], input[type=image]';
+  const ownLabel = (el) => {
     for (const v of [el.getAttribute('aria-label'), el.innerText, el.getAttribute('title'), el.value]) {
       if (typeof v === 'string' && v.trim()) return v.trim();
     }
     return '';
+  };
+  // One level up: a control in a shadow root whose own label is empty takes its host's.
+  const labelOf = (el) => {
+    const own = ownLabel(el);
+    const root = el.getRootNode();
+    return own || !(root instanceof ShadowRoot) ? own : ownLabel(root.host);
   };
   const iconsOf = (el) => {
     const out = [];
@@ -232,15 +234,23 @@ function pageScript(raw) {
     const label = labelOf(el);
     const v = decideControl({ label, icons: iconsOf(el) }, cfg);
     if (v.action === 'allow') return;
-    if (v.action === 'block') { preventDefault(e); stopImmediatePropagation(e); }
+    if (v.action === 'block') {
+      preventDefault(e);
+      stopImmediatePropagation(e);
+      warn('write-guard refused "' + label.slice(0, 120) + '": ' + v.reason);
+    }
     report({ kind: 'control', action: v.action, reason: v.reason, label: label.slice(0, 120) });
   };
-  window.addEventListener('click', (e) => {
-    if (e.target instanceof Element) judge(e.target.closest(CONTROL) || e.target, e);
+  const isControl = (n) => n instanceof Element && n.matches(CONTROL);
+  // The path crosses open shadow roots and stops at a closed one's host.
+  window.addEventListener('click', (e) => judge(e.composedPath().find(isControl), e), true);
+  window.addEventListener('submit', (e) => {
+    const form = e.target;
+    const fallback = form instanceof HTMLFormElement ? Array.prototype.find.call(form.elements, (n) => n.matches(SUBMIT)) : null;
+    judge(e.submitter || fallback, e);
   }, true);
-  window.addEventListener('submit', (e) => judge(e.submitter || e.target, e), true);
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') judge(document.activeElement, e);
+    if ((e.key === 'Enter' || e.key === ' ') && isControl(document.activeElement)) judge(document.activeElement, e);
   }, true);
 })();`;
 }

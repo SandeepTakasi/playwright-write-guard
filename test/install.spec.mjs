@@ -1,8 +1,11 @@
 // The installer, end to end in Chromium. Every page and API is served by routes on the fake
-// host https://app.test, so these tests need no network.
+// host https://app.test, and the socket test by a server of its own on 127.0.0.1, so these
+// tests need no network.
 
 import { test, expect } from '@playwright/test';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { install, loadConfig } from '../src/install.mjs';
 
@@ -17,12 +20,74 @@ const HOME = `<!doctype html>
 
 const CONTROLS = `<!doctype html>
 <script>window.hits = [];</script>
-<form id="save" onsubmit="window.hits.push('save'); return false"><button>Save</button></form>
-<form id="find" onsubmit="window.hits.push('find'); return false"><button>Search</button></form>
-<div id="remove" tabindex="0" onkeydown="window.hits.push('remove ' + event.code)">Delete</div>
-<div id="open" tabindex="0" onkeydown="window.hits.push('open ' + event.code)">Open</div>
+<div id="remove" tabindex="0">Delete</div>
+<div id="drop" role="button" tabindex="0">Delete</div>
+<div id="open" role="button" tabindex="0">Open</div>
 <button aria-label="Delete item" onclick="window.hits.push('delete')"><span id="icon">x</span></button>
-<button aria-label="Open item" onclick="window.hits.push('open item')"><span id="glyph">x</span></button>`;
+<button aria-label="Open item" onclick="window.hits.push('open item')"><span id="glyph">x</span></button>
+<script>
+for (const id of ['remove', 'drop', 'open']) {
+  document.getElementById(id).addEventListener('keydown', (e) => window.hits.push(id + ' ' + e.code));
+}
+</script>`;
+
+// Controls the page judges, and look-alikes it does not. Every element's text is "Delete".
+const REAL = `<!doctype html>
+<style>#j-image { width: 40px; height: 20px; }</style>
+<script>window.hits = [];</script>
+<div id="j-menuitem" role="menuitem">Delete</div>
+<span id="j-tab" role="tab">Delete</span>
+<span id="j-link" role="link">Delete</span>
+<form id="j-form"><input id="j-submit" type="submit" value="Delete"> <input id="j-image" type="image" title="Delete" alt="">
+<input id="n-reset" type="reset" value="Delete"></form>
+<x-btn id="j-shadow">Delete</x-btn>
+<a id="n-a">Delete</a>
+<details><summary id="n-summary">Delete</summary><p>Body</p></details>
+<div id="n-tabindex" tabindex="0">Delete</div>
+<span id="n-onclick" onclick="window.hits.push('n-onclick')">Delete</span>
+<table><tr id="n-row" tabindex="0"><td>Delete me</td><td><input id="n-check" type="checkbox"></td></tr></table>
+<p id="n-text">Delete</p>
+<x-closed id="n-closed"></x-closed>
+<script>
+customElements.define('x-btn', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<button><slot></slot></button>'; }
+});
+customElements.define('x-closed', class extends HTMLElement {
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: 'closed' });
+    root.innerHTML = '<button>Delete</button>';
+    root.querySelector('button').addEventListener('click', () => window.hits.push('n-closed'));
+  }
+});
+for (const id of ['j-menuitem', 'j-tab', 'j-link', 'j-submit', 'j-image', 'j-shadow', 'n-reset', 'n-a', 'n-summary', 'n-tabindex', 'n-row', 'n-check', 'n-text']) {
+  document.getElementById(id).addEventListener('click', () => window.hits.push(id));
+}
+document.getElementById('j-form').addEventListener('submit', (e) => { e.preventDefault(); window.hits.push('submit'); });
+</script>`;
+
+// Forms sent with requestSubmit(), so no submit event has a submitter.
+const FORMS = `<!doctype html>
+<script>window.hits = [];</script>
+<form id="f-continue"><p>Delete account</p><button>Continue</button></form>
+<form id="f-save"><button type="button">Cancel</button> <input type="submit" value="Save"></form>
+<form id="f-none"><button type="button">Delete</button></form>
+<script>
+for (const f of document.forms) f.addEventListener('submit', (e) => { e.preventDefault(); window.hits.push(f.id); });
+</script>`;
+
+// Text fields holding verbs. The form's default button is harmless, since Enter in its field
+// submits it implicitly and that submit is judged by its submitter.
+const TEXT = `<!doctype html>
+<script>window.hits = [];</script>
+<form id="t-form"><input id="t-input" name="q"> <textarea id="t-area"></textarea> <button id="t-go">Search</button></form>
+<input id="t-free">
+<script>
+document.getElementById('t-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  window.hits.push('submit ' + (e.submitter && e.submitter.id));
+});
+</script>`;
 
 // One of each control kind, every app handler attached by addEventListener so no `[onclick]`
 // makes an element the control. Each Delete is labelled on the control, never on the child.
@@ -47,13 +112,14 @@ document.getElementById('k-form').addEventListener('submit', (e) => {
 });
 </script>`;
 
-// A page that tries to switch the refusal off before anyone clicks.
+// A page that tries to switch the refusal, and its warning, off before anyone clicks.
 const NEUTER = `<!doctype html>
 <script>
 window.hits = [];
 Event.prototype.preventDefault = function () {};
 Event.prototype.stopImmediatePropagation = function () {};
 window.__writeGuardReport = () => {};
+console.warn = () => {};
 </script>
 <button id="drop">Delete</button>
 <a id="leave" href="#gone">Delete</a>
@@ -61,7 +127,7 @@ window.__writeGuardReport = () => {};
 for (const id of ['drop', 'leave']) document.getElementById(id).addEventListener('click', () => window.hits.push(id));
 </script>`;
 
-const PAGES = { '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER };
+const PAGES = { '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT };
 
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
 // records every request that reaches it. PAGES maps a path to its page, any other path is HOME.
@@ -88,7 +154,9 @@ async function open(context) {
 const send = (page, method) => page.evaluate((m) => fetch('/api/items', { method: m, body: m === 'GET' ? undefined : '{}' })
   .then((r) => r.text(), () => 'network error'), method);
 const hits = (page) => page.evaluate(() => window.hits);
-const write = (action, method) => ({ kind: 'request', action, reason: expect.any(String), method, url: `${APP}/api/items`, at: expect.any(String) });
+const write = (action, method, extra = {}) => ({ kind: 'request', action, reason: expect.any(String), method, url: `${APP}/api/items`, ...extra, at: expect.any(String) });
+// What fetch sends as the content type of a string body.
+const TEXT_TYPE = 'text/plain;charset=UTF-8';
 const control = (label) => ({ kind: 'control', action: 'block', reason: expect.any(String), label, at: expect.any(String) });
 const post = (page, path, body) => page.evaluate(([p, b]) => fetch(p, { method: 'POST', body: b })
   .then((r) => r.text(), () => 'network error'), [path, body]);
@@ -127,8 +195,8 @@ test('blocks a write, records it, and lets reads through', async ({ context }) =
   expect(record).toMatchObject({ installed: true, policy: 'read-only', blocked: 2, observed: 0 });
   expect(record.routed_requests).toBeGreaterThanOrEqual(4);
   expect(record.events).toEqual([
-    { kind: 'request', action: 'block', reason: expect.any(String), method: 'POST', url: `${APP}/api/items`, at: expect.any(String) },
-    { kind: 'request', action: 'block', reason: expect.any(String), method: 'DELETE', url: `${APP}/api/items`, at: expect.any(String) },
+    { kind: 'request', action: 'block', reason: expect.any(String), method: 'POST', url: `${APP}/api/items`, contentType: TEXT_TYPE, at: expect.any(String) },
+    { kind: 'request', action: 'block', reason: expect.any(String), method: 'DELETE', url: `${APP}/api/items`, contentType: TEXT_TYPE, at: expect.any(String) },
   ]);
   expect(new Date(record.events[0].at).toISOString()).toBe(record.events[0].at);
 });
@@ -152,12 +220,13 @@ test('a later route with continue() cannot let a blocked request past', async ({
   const guard = await install(context, { log: null });
   await page.goto(`${APP}/`);
   let calls = 0;
-  // Present page (the fixture's) and context alike; newest handlers run first.
+  // Present page (the fixture's) and context alike; page handlers run first. The page
+  // handler receives the write, and its continue() is the egress that refuses it.
   await context.route('**/api/items', (route) => { calls++; return route.continue(); });
   await page.route('**/api/items', (route) => { calls++; return route.continue(); });
 
   expect(await send(page, 'POST')).toBe('network error');
-  expect(calls).toBe(0);
+  expect(calls).toBe(1);
   expect(server.writes()).toEqual([]);
   expect(guard.record().blocked).toBe(1);
 });
@@ -269,8 +338,8 @@ test('unrouteAll and unroute remove only the caller\'s own handlers', async ({ c
   await page.route('**/api/items', (route) => route.fallback());
   const before = guard.record().routed_requests;
   expect(await send(page, 'GET')).toBe('context mock');
-  // Seen by the page wrapper, the context wrapper and the catch-all, judged once.
-  expect(guard.record().routed_requests).toBe(before + 1);
+  // Fulfilled before it reached an egress, so never judged or counted.
+  expect(guard.record().routed_requests).toBe(before);
 
   await page.unrouteAll();
   await context.unrouteAll({ behavior: 'ignoreErrors' });
@@ -306,36 +375,35 @@ test('native dialogs are dismissed under read-only', async ({ context }) => {
   expect(await page.evaluate(() => confirm('Delete everything?'))).toBe(false);
 });
 
-test('a form sent with requestSubmit() is judged by its label', async ({ context }) => {
+test('a submit with no submitter is judged by the form\'s submit button', async ({ context }) => {
   await serve(context);
   const guard = await install(context, { log: null });
-  const page = await context.newPage();
-  await page.goto(`${APP}/controls`);
+  const page = await visit(context, '/forms');
 
-  await page.evaluate(() => {
-    document.getElementById('save').requestSubmit();
-    document.getElementById('find').requestSubmit();
-  });
-  expect(await hits(page)).toEqual(['find']);
+  // The form's own text and its plain buttons do not count: only its first submit button
+  // does, and a form with none is not judged.
+  await page.evaluate(() => { for (const f of document.forms) f.requestSubmit(); });
+  expect(await hits(page)).toEqual(['f-continue', 'f-none']);
   await expect.poll(() => guard.record().blocked).toBe(1);
   expect(guard.record().events).toEqual([control('Save')]);
 });
 
-test('Space and Enter on a focusable element are judged by its label', async ({ context }) => {
+test('Space and Enter are judged only on a control', async ({ context }) => {
   await serve(context);
   const guard = await install(context, { log: null });
   const page = await context.newPage();
   await page.goto(`${APP}/controls`);
 
   // No click handler anywhere, and a div has no click activation on either key: only the
-  // keydown listener stands between the key and the app.
+  // keydown listener stands between the key and the app. A tabindex div labelled Delete is
+  // not a control, so it is not judged in the page; a role=button one is.
   for (const key of ['Space', 'Enter']) {
-    await page.focus('#remove');
-    await page.keyboard.press(key);
-    await page.focus('#open');
-    await page.keyboard.press(key);
+    for (const id of ['remove', 'drop', 'open']) {
+      await page.focus(`#${id}`);
+      await page.keyboard.press(key);
+    }
   }
-  expect(await hits(page)).toEqual(['open Space', 'open Enter']);
+  expect(await hits(page)).toEqual(['remove Space', 'open Space', 'remove Enter', 'open Enter']);
   await expect.poll(() => guard.record().blocked).toBe(2);
   expect(guard.record().events).toEqual([control('Delete'), control('Delete')]);
 });
@@ -542,7 +610,6 @@ test('each control kind is judged', async ({ context }) => {
   const cases = [
     ['#k-button span', 'Delete'],
     ['#k-a span', 'Delete'],
-    ['#k-tabindex span', 'Delete'],
     ['#k-role span', 'Delete'],
     ['#k-title svg', 'Delete'],
     ['#k-value', 'Delete'],
@@ -556,9 +623,13 @@ test('each control kind is judged', async ({ context }) => {
   }
   expect(await page.evaluate(() => location.hash)).toBe('');
 
+  // A tabindex div labelled Delete is not a control, so it is not judged in the page.
+  await page.click('#k-tabindex span');
+  expect(await hits(page)).toEqual(['k-tabindex']);
+
   // The submitter is judged, not the form, whose text also holds "Save".
   await page.click('#k-cancel');
-  expect(await hits(page)).toEqual(['k-cancel', 'submit k-cancel']);
+  expect(await hits(page)).toEqual(['k-tabindex', 'k-cancel', 'submit k-cancel']);
   expect(guard.record().blocked).toBe(cases.length);
 });
 
@@ -600,14 +671,14 @@ test('an override with no options is recorded once under observe', async ({ cont
   const server = await serve(context);
   const guard = await install(context, { policy: 'observe', log: null });
   const page = await open(context);
-  // An override with no options sends the original request, already judged and recorded.
-  // fallback() takes the same judging path as continue() and reaches the fake server, where
-  // continue() would leave for the network.
+  // fallback() is not an egress: the request goes on to the catch-all, the one egress it
+  // reaches, is recorded there once and reaches the fake server, where continue() would
+  // leave for the network.
   await page.route('**/api/items', (route) => route.fallback());
 
   expect(await send(page, 'POST')).toBe(SERVED);
   expect(server.writes()).toEqual(['POST /api/items']);
-  expect(guard.record().events).toEqual([write('observe', 'POST')]);
+  expect(guard.record().events).toEqual([write('observe', 'POST', { contentType: TEXT_TYPE })]);
 });
 
 test('a refused override aborts with blockedbyclient', async ({ context }) => {
@@ -676,4 +747,249 @@ test('an empty WRITE_GUARD_POLICY is ignored', async ({}, testInfo) => {
   await withEnv({ WRITE_GUARD_POLICY: '' }, () => {
     expect(loadConfig(file).policy).toBe('observe');
   });
+});
+
+test('a caller can fulfill or abort a write', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  const routed = guard.record().routed_requests;
+
+  await page.route('**/api/items', (route) => route.fulfill({ status: 201, body: 'mocked' }));
+  expect(await send(page, 'POST')).toBe('mocked');
+  await page.unrouteAll();
+  await context.route('**/api/items', (route) => route.abort('failed'));
+  expect(await send(page, 'DELETE')).toBe('network error');
+
+  // Neither reached an egress: nothing left the browser, nothing is judged or recorded.
+  expect(server.writes()).toEqual([]);
+  expect(guard.record()).toMatchObject({ blocked: 0, observed: 0, routed_requests: routed, events: [] });
+});
+
+test('a continued or fetched write is judged at egress', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  const routed = guard.record().routed_requests;
+  const api = () => server.seen.filter((s) => s.endsWith('/api/items'));
+
+  // A write rewritten into a read before it leaves is a read: only what leaves is judged.
+  await page.route('**/api/items', (route) => route.fallback({ method: 'GET' }));
+  expect(await send(page, 'POST')).toBe(SERVED);
+  expect(api()).toEqual(['GET /api/items']);
+  expect(guard.record().events).toEqual([]);
+  await page.unrouteAll();
+
+  // A fallback override reaches a later handler's continue(), which judges it as overridden.
+  let continued = 0;
+  await page.route('**/api/items', (route) => route.fallback({ method: 'DELETE' }));
+  await context.route('**/api/items', (route) => { continued++; return route.continue(); });
+  expect(await send(page, 'GET')).toBe('network error');
+  expect(continued).toBe(1);
+  await page.unrouteAll();
+  await context.unrouteAll();
+
+  // A refused fetch, then a fallback to the catch-all: two egress attempts, one request.
+  let message;
+  await page.route('**/api/items', async (route) => {
+    message = await route.fetch({ method: 'PATCH' }).then(() => 'fetched', (e) => e.message);
+    return route.fallback();
+  });
+  expect(await send(page, 'GET')).toBe(SERVED);
+  expect(message).toBe(`write-guard: route.fetch of PATCH ${APP}/api/items is refused under read-only`);
+
+  expect(api()).toEqual(['GET /api/items', 'GET /api/items']);
+  expect(guard.record()).toMatchObject({
+    blocked: 2,
+    routed_requests: routed + 3,
+    events: [write('block', 'DELETE'), write('block', 'PATCH')],
+  });
+});
+
+test('only real controls are judged', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/real');
+
+  // Each of these is a control labelled Delete, the open shadow one through its host.
+  const judged = ['#j-menuitem', '#j-tab', '#j-link', '#j-submit', '#j-image', '#j-shadow'];
+  for (const [i, selector] of judged.entries()) {
+    await page.click(selector);
+    await expect.poll(() => guard.record().blocked, { message: selector }).toBe(i + 1);
+    expect(guard.record().events[i], selector).toEqual(control('Delete'));
+  }
+  expect(await hits(page)).toEqual([]);
+
+  // None of these is a control: an anchor without href, a reset input, a summary, a tabindex
+  // div, a plain onclick element, a checkbox in a tabindex row, plain text, and a button in
+  // a closed shadow root.
+  for (const selector of ['#n-reset', '#n-a', '#n-summary', '#n-tabindex', '#n-onclick', '#n-check', '#n-text', '#n-closed']) {
+    await page.click(selector);
+  }
+  expect(await hits(page)).toEqual(['n-reset', 'n-a', 'n-summary', 'n-tabindex', 'n-onclick', 'n-check', 'n-row', 'n-text', 'n-closed']);
+  expect(await page.isChecked('#n-check')).toBe(true);
+  expect(guard.record().blocked).toBe(judged.length);
+});
+
+test('text fields never refuse a typed space or Enter', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/text');
+
+  await page.click('#t-input');
+  await page.keyboard.type('Delete it');
+  await page.keyboard.press('Enter');
+  await page.click('#t-area');
+  await page.keyboard.type('Remove all');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('Save it');
+  await page.click('#t-free');
+  await page.keyboard.type('Send now');
+  await page.keyboard.press('Enter');
+
+  expect(await page.inputValue('#t-input')).toBe('Delete it');
+  expect(await page.inputValue('#t-area')).toBe('Remove all\nSave it');
+  expect(await page.inputValue('#t-free')).toBe('Send now');
+  // Enter in the form's field submits it, judged by its harmless default button.
+  expect(await hits(page)).toEqual(['submit t-go']);
+  expect(guard.record()).toMatchObject({ blocked: 0, events: [] });
+});
+
+test('a refused click warns in the console', async ({ context, browser }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  // The page swaps console.warn out before anyone clicks; the guard kept the original.
+  const page = await visit(context, '/neuter');
+  const warnings = [];
+  page.on('console', (m) => { if (m.type() === 'warning') warnings.push(m.text()); });
+
+  const long = `Delete ${'x'.repeat(200)}`;
+  await page.click('#drop');
+  await page.evaluate((l) => document.body.insertAdjacentHTML('beforeend', `<button id="long">${l}</button>`), long);
+  await page.click('#long');
+  await expect.poll(() => warnings.length).toBe(2);
+  await expect.poll(() => guard.record().blocked).toBe(2);
+  const [a, b] = guard.record().events;
+  expect(warnings).toEqual([
+    `write-guard refused "Delete": ${a.reason}`,
+    `write-guard refused "${long.slice(0, 120)}": ${b.reason}`,
+  ]);
+
+  // Under observe the click goes through and nothing reaches the console.
+  const other = await browser.newContext();
+  try {
+    await serve(other);
+    const watcher = await install(other, { policy: 'observe', log: null });
+    const seen = await open(other);
+    const messages = [];
+    seen.on('console', (m) => messages.push(`${m.type()} ${m.text()}`));
+    await seen.click('#del');
+    await expect.poll(() => watcher.record().observed).toBe(1);
+    await seen.evaluate(() => console.log('done'));
+    await expect.poll(() => messages.length).toBeGreaterThan(0);
+    expect(messages).toEqual(['log done']);
+  } finally {
+    await other.close();
+  }
+});
+
+test('events carry the content type and, with logBodies, a body excerpt', async ({ context, browser }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  await page.evaluate(() => fetch('/api/items', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"a":1}' }).catch(() => {}));
+  await page.evaluate(() => fetch('/api/items', { method: 'DELETE' }).catch(() => {}));
+  // No body by default; no content type when the request has none.
+  expect(guard.record().events).toEqual([write('block', 'POST', { contentType: 'application/json' }), write('block', 'DELETE')]);
+
+  const other = await browser.newContext();
+  try {
+    await serve(other);
+    const watcher = await install(other, { log: null, logBodies: true });
+    const seen = await open(other);
+    const long = `${'a'.repeat(499)}bc`;
+    await seen.evaluate((b) => fetch('/api/items', { method: 'PUT', body: b }).catch(() => {}), long);
+    await seen.evaluate(() => fetch('/api/items', { method: 'DELETE' }).catch(() => {}));
+    // An override's effective headers and body are what the event carries.
+    await seen.route('**/api/items', (route) => route.fallback({ method: 'POST', headers: { 'Content-Type': 'text/csv' }, postData: 'a,b' }));
+    await send(seen, 'GET');
+    expect(watcher.record().events).toEqual([
+      write('block', 'PUT', { contentType: TEXT_TYPE, body: `${'a'.repeat(499)}b` }),
+      write('block', 'DELETE'),
+      write('block', 'POST', { contentType: 'text/csv', body: 'a,b' }),
+    ]);
+  } finally {
+    await other.close();
+  }
+});
+
+test('a header signature allows a read', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null, allow: [{ method: 'POST', url: '/api/action$', headers: { 'Next-Action': '^abc$' } }] });
+  const page = await open(context);
+  const act = (headers) => page.evaluate((h) => fetch('/api/action', { method: 'POST', headers: h, body: '[]' })
+    .then((r) => r.text(), () => 'network error'), headers);
+
+  expect(await act({ 'Next-Action': 'abc' })).toBe(SERVED);
+  expect(await act({ 'Next-Action': 'abd' })).toBe('network error');
+  expect(await act({})).toBe('network error');
+  expect(server.writes()).toEqual(['POST /api/action']);
+
+  // Overrides replace the whole header set, so an empty one drops the header the Sig needs.
+  await page.route('**/api/action', (route) => route.continue({ headers: {} }));
+  expect(await act({ 'Next-Action': 'abc' })).toBe('network error');
+  await page.unrouteAll();
+  await page.route('**/api/action', (route) => route.fallback({ headers: { ...route.request().headers(), 'x-extra': '1' } }));
+  expect(await act({ 'Next-Action': 'abc' })).toBe(SERVED);
+
+  expect(server.writes()).toEqual(['POST /api/action', 'POST /api/action']);
+  expect(guard.record().blocked).toBe(3);
+});
+
+test('a websocket open is recorded', async ({ context }) => {
+  // A page on https://app.test cannot open ws://127.0.0.1, so the page comes from the
+  // socket server's own origin. It answers one short text frame with its echo.
+  const sockets = [];
+  const server = createServer((req, res) => res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><p>Socket</p>'));
+  server.on('upgrade', (req, socket) => {
+    sockets.push(socket);
+    socket.on('error', () => {});
+    const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    socket.on('data', (d) => {
+      if ((d[0] & 0x0f) !== 1) return;
+      const length = d[1] & 0x7f;
+      const mask = d.subarray(2, 6);
+      const payload = Buffer.from(d.subarray(6, 6 + length).map((byte, i) => byte ^ mask[i % 4]));
+      socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]));
+    });
+  });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  try {
+    const host = `127.0.0.1:${server.address().port}`;
+    const guard = await install(context, { log: null });
+    const page = await context.newPage();
+    await page.goto(`http://${host}/`);
+    const routed = guard.record().routed_requests;
+
+    const echo = await page.evaluate((u) => new Promise((resolve, reject) => {
+      const ws = new WebSocket(u);
+      ws.addEventListener('open', () => ws.send('hello'));
+      ws.addEventListener('message', (e) => { resolve(e.data); ws.close(); });
+      ws.addEventListener('error', () => reject(new Error('socket error')));
+    }), `ws://${host}/socket`);
+
+    expect(echo).toBe('hello');
+    expect(guard.record()).toMatchObject({
+      blocked: 0,
+      observed: 0,
+      routed_requests: routed,
+      events: [{ kind: 'websocket', action: 'open', url: `ws://${host}/socket`, at: expect.any(String) }],
+    });
+    expect(Object.keys(guard.record().events[0]).sort()).toEqual(['action', 'at', 'kind', 'url']);
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.closeAllConnections();
+    await new Promise((done) => server.close(done));
+  }
 });
