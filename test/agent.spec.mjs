@@ -157,8 +157,15 @@ test('the launcher\'s log is complete after close', async ({}, testInfo) => {
     await page.evaluate(() => Promise.all(['POST', 'PUT', 'DELETE', 'PATCH', 'POST'].map((m) => fetch('/api/items', { method: m, body: '{}' }).catch(() => {}))));
     const { events } = g.guard.record();
     expect(events.length).toBeGreaterThanOrEqual(5);
+    // Spy on both closes: close() must finish the guard before it starts closing the context.
+    const order = [];
+    const guardClose = g.guard.close.bind(g.guard);
+    g.guard.close = async () => { order.push('guard:start'); const r = await guardClose(); order.push('guard:end'); return r; };
+    const contextClose = g.context.close.bind(g.context);
+    g.context.close = async (...a) => { order.push('context:start'); return contextClose(...a); };
     await g.close();
     closed = true;
+    expect(order.slice(0, 3)).toEqual(['guard:start', 'guard:end', 'context:start']);
     const lines = readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
     expect(lines).toHaveLength(events.length);
     expect(lines.every((l) => l.action === 'block')).toBe(true);
