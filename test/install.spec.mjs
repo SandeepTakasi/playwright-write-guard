@@ -19,7 +19,9 @@ const CONTROLS = `<!doctype html>
 <form id="save" onsubmit="window.hits.push('save'); return false"><button>Save</button></form>
 <form id="find" onsubmit="window.hits.push('find'); return false"><button>Search</button></form>
 <div id="remove" tabindex="0" onkeydown="window.hits.push('remove ' + event.code)">Delete</div>
-<div id="open" tabindex="0" onkeydown="window.hits.push('open ' + event.code)">Open</div>`;
+<div id="open" tabindex="0" onkeydown="window.hits.push('open ' + event.code)">Open</div>
+<button aria-label="Delete item" onclick="window.hits.push('delete')"><span id="icon">x</span></button>
+<button aria-label="Open item" onclick="window.hits.push('open item')"><span id="glyph">x</span></button>`;
 
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
 // records every request that reaches it. `/controls` serves CONTROLS, any other page HOME.
@@ -276,7 +278,21 @@ test('Space and Enter on a focusable element are judged by its label', async ({ 
   expect(guard.record().events).toEqual([control('Delete'), control('Delete')]);
 });
 
-test('dialogs are dismissed even when the caller accepts them', async ({ context }) => {
+test('an icon button is judged by its aria-label', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await context.newPage();
+  await page.goto(`${APP}/controls`);
+
+  // The click lands on the inner span, whose own text is "x": the label is the button's.
+  await page.click('#icon');
+  await page.click('#glyph');
+  expect(await hits(page)).toEqual(['open item']);
+  await expect.poll(() => guard.record().blocked).toBe(1);
+  expect(guard.record().events).toEqual([control('Delete item')]);
+});
+
+test('dialogs are dismissed even when the caller accepts them',async ({ context }) => {
   await serve(context);
   await install(context, { log: null });
   const page = await open(context);
