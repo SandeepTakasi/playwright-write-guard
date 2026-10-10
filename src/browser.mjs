@@ -1,5 +1,6 @@
 // playwright-write-guard/browser: a guarded Chromium that an agent attaches to. The guard runs
-// in this process, so an attached client's own routes cannot bypass or remove it.
+// in this process, so an attached client cannot remove it. Its context.route overrides, its
+// route.fetch() and any context other than this one are not seen (see the README's limits).
 
 import { chromium } from 'playwright-core';
 import { install, loadConfig } from './install.mjs';

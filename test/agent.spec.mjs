@@ -4,7 +4,8 @@
 
 import { test, expect, chromium } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { startGuardedBrowser } from '../src/browser.mjs';
 import initPage from '../src/init-page.mjs';
@@ -175,7 +176,107 @@ test('the launcher\'s log is complete after close', async ({}, testInfo) => {
   }
 });
 
+test('the launcher defaults its config to loadConfig', async ({}, testInfo) => {
+  const file = testInfo.outputPath('observe.json');
+  writeFileSync(file, JSON.stringify({ policy: 'observe', log: null }));
+  const saved = { c: process.env.WRITE_GUARD_CONFIG, p: process.env.WRITE_GUARD_POLICY };
+  process.env.WRITE_GUARD_CONFIG = file;
+  delete process.env.WRITE_GUARD_POLICY;
+  let g;
+  let client;
+  try {
+    g = await startGuardedBrowser({ port: 0 });
+    client = await chromium.connect(g.wsEndpoint);
+    const server = await serve(client.contexts()[0]);
+    const page = await open(client.contexts()[0]);
+    // Under the default read-only this POST is blocked and never reaches the client's route.
+    expect(await send(page, 'POST')).toBe(SERVED);
+    expect(server.writes()).toEqual(['POST /api/items']);
+    expect(g.guard.record()).toMatchObject({ policy: 'observe' });
+  } finally {
+    for (const [k, v] of [['WRITE_GUARD_CONFIG', saved.c], ['WRITE_GUARD_POLICY', saved.p]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    await client?.close().catch(() => {});
+    await g?.close();
+  }
+});
+
+test('close() closes the browser', async () => {
+  const g = await startGuardedBrowser({ port: 0, config: { log: null } });
+  expect(g.browser.isConnected()).toBe(true);
+  await g.close();
+  expect(g.browser.isConnected()).toBe(false);
+});
+
+test('the launcher binds under its title', async ({}, testInfo) => {
+  // Playwright writes one descriptor per bound browser, with its title, into the server registry.
+  const dir = testInfo.outputPath('registry');
+  const saved = process.env.PWTEST_SERVER_REGISTRY;
+  process.env.PWTEST_SERVER_REGISTRY = dir;
+  let g;
+  try {
+    g = await startGuardedBrowser({ port: 0, title: 'items-run', config: { log: null } });
+    const found = readdirSync(dir).map((f) => JSON.parse(readFileSync(`${dir}/${f}`, 'utf8')));
+    expect(found.map((d) => d.title)).toEqual(['items-run']);
+    expect(found[0].endpoint).toBe(g.wsEndpoint);
+  } finally {
+    if (saved === undefined) delete process.env.PWTEST_SERVER_REGISTRY; else process.env.PWTEST_SERVER_REGISTRY = saved;
+    await g?.close();
+  }
+});
+
+// Spawns the command and resolves once it has printed everything up to its last line, so its
+// signal handlers are in place.
+async function runCommand(args, testInfo) {
+  const config = testInfo.outputPath('config.json');
+  writeFileSync(config, JSON.stringify({ log: null }));
+  const child = spawn(process.execPath, [BIN, '--config', config, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // 'close' comes after the output streams end, so stderr is complete once this resolves.
+  const exited = new Promise((done) => child.on('close', (code, signal) => done({ code, signal })));
+  let out = '';
+  child.stdout.setEncoding('utf8');
+  await new Promise((done, fail) => {
+    child.stdout.on('data', (d) => { out += d; if (out.includes('Stop with Ctrl+C.\n')) done(); });
+    child.on('exit', () => fail(new Error(`exited early: ${out}`)));
+  });
+  // The child swaps its signal handlers right after that last line; a signal that lands in
+  // between would find none, so give it a moment.
+  await new Promise((done) => setTimeout(done, 300));
+  let err = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (d) => { err += d; });
+  return { child, exited, stderr: () => err, endpoint: out.match(/^endpoint: (\S+)$/m)?.[1] };
+}
+
 test.describe('the command', () => {
+  test('the command honours --host and --port', async ({}, testInfo) => {
+    const probe = net.createServer();
+    await new Promise((done) => probe.listen(0, '127.0.0.1', done));
+    const { port } = probe.address();
+    await new Promise((done) => probe.close(done));
+
+    // The second host differs from the default, so a command that ignored --host would show.
+    for (const [host, shown] of [['127.0.0.1', '127.0.0.1'], ['::1', '[::1]']]) {
+      const { child, exited, endpoint } = await runCommand(['--host', host, '--port', String(port)], testInfo);
+      try {
+        expect(endpoint.startsWith(`ws://${shown}:${port}/`)).toBe(true);
+      } finally {
+        child.kill('SIGTERM');
+      }
+      expect(await exited).toEqual({ code: 0, signal: null });
+    }
+  });
+
+  test('the command exits 0 on SIGINT', async ({}, testInfo) => {
+    const { child, exited, stderr } = await runCommand(['--port', '0'], testInfo);
+    child.kill('SIGINT');
+    expect(await exited).toEqual({ code: 0, signal: null });
+    // If Playwright's own SIGINT handler were still in place it would close the browser at the
+    // same time, and the command's own close would then report an error.
+    expect(stderr()).toBe('');
+  });
+
   test('prints the endpoint and how to attach, and exits 0 on SIGTERM', async ({}, testInfo) => {
     const config = testInfo.outputPath('config.json');
     writeFileSync(config, JSON.stringify({ log: null }));
