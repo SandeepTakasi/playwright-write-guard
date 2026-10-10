@@ -2,7 +2,8 @@
 // host https://app.test, so these tests need no network.
 
 import { test, expect } from '@playwright/test';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { install, loadConfig } from '../src/install.mjs';
 
 const APP = 'https://app.test';
@@ -23,8 +24,47 @@ const CONTROLS = `<!doctype html>
 <button aria-label="Delete item" onclick="window.hits.push('delete')"><span id="icon">x</span></button>
 <button aria-label="Open item" onclick="window.hits.push('open item')"><span id="glyph">x</span></button>`;
 
+// One of each control kind, every app handler attached by addEventListener so no `[onclick]`
+// makes an element the control. Each Delete is labelled on the control, never on the child.
+const KINDS = `<!doctype html>
+<style>#k-icon { width: 40px; height: 20px; }</style>
+<script>window.hits = [];</script>
+<button id="k-button" aria-label="Delete"><span>x</span></button>
+<a id="k-a" href="#gone" aria-label="Delete"><span>x</span></a>
+<div id="k-tabindex" tabindex="0" aria-label="Delete"><span>x</span></div>
+<div id="k-role" role="button" aria-label="Delete"><span>x</span></div>
+<button id="k-title" title="Delete"><svg width="16" height="16"></svg></button>
+<input id="k-value" type="button" value="Delete">
+<button id="k-icon" class="icon-trash"></button>
+<form id="k-form"><button id="k-cancel" type="submit">Cancel</button> <button type="submit">Save</button></form>
+<script>
+for (const id of ['k-button', 'k-a', 'k-tabindex', 'k-role', 'k-title', 'k-value', 'k-icon', 'k-cancel']) {
+  document.getElementById(id).addEventListener('click', () => window.hits.push(id));
+}
+document.getElementById('k-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  window.hits.push('submit ' + e.submitter.id);
+});
+</script>`;
+
+// A page that tries to switch the refusal off before anyone clicks.
+const NEUTER = `<!doctype html>
+<script>
+window.hits = [];
+Event.prototype.preventDefault = function () {};
+Event.prototype.stopImmediatePropagation = function () {};
+window.__writeGuardReport = () => {};
+</script>
+<button id="drop">Delete</button>
+<a id="leave" href="#gone">Delete</a>
+<script>
+for (const id of ['drop', 'leave']) document.getElementById(id).addEventListener('click', () => window.hits.push(id));
+</script>`;
+
+const PAGES = { '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER };
+
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
-// records every request that reaches it. `/controls` serves CONTROLS, any other page HOME.
+// records every request that reaches it. PAGES maps a path to its page, any other path is HOME.
 async function serve(context) {
   const seen = [];
   await context.route(`${APP}/**`, async (route) => {
@@ -34,7 +74,7 @@ async function serve(context) {
     if (url.pathname.startsWith('/api/')) {
       return route.fulfill({ status: 200, contentType: 'application/json', body: SERVED });
     }
-    return route.fulfill({ status: 200, contentType: 'text/html', body: url.pathname === '/controls' ? CONTROLS : HOME });
+    return route.fulfill({ status: 200, contentType: 'text/html', body: PAGES[url.pathname] ?? HOME });
   });
   return { seen, writes: () => seen.filter((s) => !s.startsWith('GET ')) };
 }
@@ -50,6 +90,28 @@ const send = (page, method) => page.evaluate((m) => fetch('/api/items', { method
 const hits = (page) => page.evaluate(() => window.hits);
 const write = (action, method) => ({ kind: 'request', action, reason: expect.any(String), method, url: `${APP}/api/items`, at: expect.any(String) });
 const control = (label) => ({ kind: 'control', action: 'block', reason: expect.any(String), label, at: expect.any(String) });
+const post = (page, path, body) => page.evaluate(([p, b]) => fetch(p, { method: 'POST', body: b })
+  .then((r) => r.text(), () => 'network error'), [path, body]);
+
+async function visit(context, path) {
+  const page = await context.newPage();
+  await page.goto(`${APP}${path}`);
+  return page;
+}
+
+// Sets (or, given undefined, unsets) the named variables for the length of fn.
+async function withEnv(vars, fn) {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  const set = (all) => {
+    for (const [k, v] of Object.entries(all)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  };
+  try { set(vars); return await fn(); } finally { set(saved); }
+}
+
+// An unlocked APIRequestContext refuses a negative maxRetries in its own option check, before
+// sending anything; a locked one answers with the guard's refusal first. No request leaves.
+const sendThrough = (client, method) => client[method](`${APP}/api/items`, { maxRetries: -1 }).then(() => 'sent', (e) => e.message);
+const OWN_CHECK = "'maxRetries' must be greater than or equal to '0'";
 
 test('blocks a write, records it, and lets reads through', async ({ context }) => {
   const server = await serve(context);
@@ -458,4 +520,160 @@ test('loadConfig reads a path, then WRITE_GUARD_CONFIG, and honours WRITE_GUARD_
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
+});
+
+test('every send method is refused under read-only', async ({ context, page }) => {
+  const server = await serve(context);
+  await install(context, { log: null });
+  for (const client of [context.request, page.request]) {
+    for (const method of ['fetch', 'get', 'post', 'put', 'patch', 'delete', 'head']) {
+      expect(await sendThrough(client, method)).toBe(`write-guard: ${method} through APIRequestContext is refused under read-only`);
+    }
+  }
+  expect(server.seen).toEqual([]);
+});
+
+test('each control kind is judged', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null, controls: { icons: ['icon-trash'] } });
+  const page = await visit(context, '/kinds');
+
+  // Each click lands on a child or on a control whose label comes from one source only.
+  const cases = [
+    ['#k-button span', 'Delete'],
+    ['#k-a span', 'Delete'],
+    ['#k-tabindex span', 'Delete'],
+    ['#k-role span', 'Delete'],
+    ['#k-title svg', 'Delete'],
+    ['#k-value', 'Delete'],
+    ['#k-icon', ''],
+  ];
+  for (const [i, [selector, label]] of cases.entries()) {
+    await page.click(selector);
+    await expect.poll(() => guard.record().blocked, { message: selector }).toBe(i + 1);
+    expect(await hits(page), selector).toEqual([]);
+    expect(guard.record().events[i], selector).toEqual(control(label));
+  }
+  expect(await page.evaluate(() => location.hash)).toBe('');
+
+  // The submitter is judged, not the form, whose text also holds "Save".
+  await page.click('#k-cancel');
+  expect(await hits(page)).toEqual(['k-cancel', 'submit k-cancel']);
+  expect(guard.record().blocked).toBe(cases.length);
+});
+
+test('a page cannot neuter the refusal', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/neuter');
+
+  await page.click('#drop');
+  await page.click('#leave');
+  expect(await hits(page)).toEqual([]);
+  expect(await page.evaluate(() => location.hash)).toBe('');
+  await expect.poll(() => guard.record().blocked).toBe(2);
+  expect(guard.record().events).toEqual([control('Delete'), control('Delete')]);
+});
+
+test('a synthetic click is judged', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/kinds');
+
+  await page.evaluate(() => document.getElementById('k-button').click());
+  expect(await hits(page)).toEqual([]);
+  await expect.poll(() => guard.record().blocked).toBe(1);
+  expect(guard.record().events).toEqual([control('Delete')]);
+});
+
+test('a body signature is applied', async ({ context }) => {
+  const server = await serve(context);
+  await install(context, { log: null, allow: [{ method: 'POST', url: '/api/query$', body: 'kind.*read' }] });
+  const page = await open(context);
+
+  expect(await post(page, '/api/query', '{"kind":"read"}')).toBe(SERVED);
+  expect(await post(page, '/api/query', '{"kind":"write"}')).toBe('network error');
+  expect(server.writes()).toEqual(['POST /api/query']);
+});
+
+test('an override with no options is recorded once under observe', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { policy: 'observe', log: null });
+  const page = await open(context);
+  // An override with no options sends the original request, already judged and recorded.
+  // fallback() takes the same judging path as continue() and reaches the fake server, where
+  // continue() would leave for the network.
+  await page.route('**/api/items', (route) => route.fallback());
+
+  expect(await send(page, 'POST')).toBe(SERVED);
+  expect(server.writes()).toEqual(['POST /api/items']);
+  expect(guard.record().events).toEqual([write('observe', 'POST')]);
+});
+
+test('a refused override aborts with blockedbyclient', async ({ context }) => {
+  const server = await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  await page.route('**/api/items', (route) => route.continue({ method: 'DELETE' }));
+
+  const failed = page.waitForEvent('requestfailed');
+  expect(await send(page, 'GET')).toBe('network error');
+  // Chromium reports a route abort as net::ERR_BLOCKED_BY_CLIENT.Inspector.
+  expect((await failed).failure().errorText).toMatch(/^net::ERR_BLOCKED_BY_CLIENT\b/);
+  expect(server.writes()).toEqual([]);
+});
+
+test('observe neither locks request clients nor dismisses dialogs', async ({ context, page }) => {
+  await serve(context);
+  await install(context, { policy: 'observe', log: null });
+  const later = await open(context);
+
+  // `page` existed before install, `later` was opened after it.
+  for (const client of [context.request, page.request, later.request]) {
+    expect(await sendThrough(client, 'post')).toContain(OWN_CHECK);
+  }
+  later.on('dialog', (d) => d.accept());
+  expect(await later.evaluate(() => confirm('Delete everything?'))).toBe(true);
+});
+
+test('unroute matches an equal RegExp and route\'s disposable', async ({ context }) => {
+  await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  const seen = [];
+  const h = (route) => { seen.push('h'); return route.fallback(); };
+  const h2 = (route) => { seen.push('h2'); return route.fallback(); };
+  await context.route(/\/api\/items$/, h);
+  const disposable = await page.route('**/api/items', h2);
+  expect(await send(page, 'GET')).toBe(SERVED);
+  expect(seen).toEqual(['h2', 'h']);
+
+  seen.length = 0;
+  await context.unroute(/\/api\/items$/, h);
+  await disposable.dispose();
+  expect(await send(page, 'GET')).toBe(SERVED);
+  expect(seen).toEqual([]);
+});
+
+test('the default config file is found', async ({}, testInfo) => {
+  const dir = testInfo.outputPath('cwd');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'write-guard.config.json'), '{ "policy": "observe" }');
+  const cwd = process.cwd();
+  try {
+    process.chdir(dir);
+    await withEnv({ WRITE_GUARD_CONFIG: undefined, WRITE_GUARD_POLICY: undefined }, () => {
+      expect(loadConfig()).toEqual({ policy: 'observe' });
+    });
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test('an empty WRITE_GUARD_POLICY is ignored', async ({}, testInfo) => {
+  const file = testInfo.outputPath('observe.json');
+  writeFileSync(file, '{ "policy": "observe" }');
+  await withEnv({ WRITE_GUARD_POLICY: '' }, () => {
+    expect(loadConfig(file).policy).toBe('observe');
+  });
 });

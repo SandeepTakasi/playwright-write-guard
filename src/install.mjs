@@ -208,8 +208,10 @@ function pageScript(raw) {
   const compileConfig = ${compileConfig.toString()};
   const decideControl = ${decideControl.toString()};
   const cfg = compileConfig(${JSON.stringify(raw ?? {})});
-  // Captured before any page script runs, so the page cannot swap it out.
+  // Captured before any page script runs, so the page cannot swap them out.
   const bind = window.${BINDING};
+  const preventDefault = Function.prototype.call.bind(Event.prototype.preventDefault);
+  const stopImmediatePropagation = Function.prototype.call.bind(Event.prototype.stopImmediatePropagation);
   const report = (e) => { try { Promise.resolve(bind(e)).catch(() => {}); } catch (_) {} };
   const CONTROL = 'button, a, [role=button], [role=menuitem], [role=link], [role=tab], input[type=submit], input[type=button], input[type=image], summary, [onclick], [tabindex]';
   const labelOf = (el) => {
@@ -230,7 +232,7 @@ function pageScript(raw) {
     const label = labelOf(el);
     const v = decideControl({ label, icons: iconsOf(el) }, cfg);
     if (v.action === 'allow') return;
-    if (v.action === 'block') { e.preventDefault(); e.stopImmediatePropagation(); }
+    if (v.action === 'block') { preventDefault(e); stopImmediatePropagation(e); }
     report({ kind: 'control', action: v.action, reason: v.reason, label: label.slice(0, 120) });
   };
   window.addEventListener('click', (e) => {
