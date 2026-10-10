@@ -209,7 +209,7 @@ function pageScript(raw) {
   const warn = console.warn.bind(console);
   const report = (e) => { try { Promise.resolve(bind(e)).catch(() => {}); } catch (_) {} };
   const CONTROL = 'button, a[href], [role=button], [role=menuitem], [role=link], [role=tab], input[type=submit], input[type=button], input[type=image]';
-  const SUBMIT = 'button:not([type]), button[type=submit], input[type=submit], input[type=image]';
+  const SUBMIT = 'button:not([type]), button[type=submit], input[type=submit]';
   const ownLabel = (el) => {
     for (const v of [el.getAttribute('aria-label'), el.innerText, el.getAttribute('title'), el.value]) {
       if (typeof v === 'string' && v.trim()) return v.trim();

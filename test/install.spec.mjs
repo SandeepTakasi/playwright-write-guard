@@ -127,7 +127,36 @@ console.warn = () => {};
 for (const id of ['drop', 'leave']) document.getElementById(id).addEventListener('click', () => window.hits.push(id));
 </script>`;
 
-const PAGES = { '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT };
+// A form with two submit buttons, a harmless one second.
+const SUBMITTERS = `<!doctype html>
+<script>window.hits = [];</script>
+<form id="s-form"><button id="s-delete" type="submit">Delete</button> <button id="s-keep" type="submit">Keep</button></form>
+<script>
+document.getElementById('s-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  window.hits.push('submit ' + e.submitter.id);
+});
+</script>`;
+
+// Each form's only submit button is labelled Delete: a plain button, a typed one, and one
+// owned through the form attribute from outside the form. Sent with requestSubmit().
+const OWNERS = `<!doctype html>
+<script>window.hits = [];</script>
+<form id="o-plain"><button>Delete</button></form>
+<form id="o-typed"><button type="submit">Delete</button></form>
+<form id="o-owned"></form><button form="o-owned" type="submit">Delete</button>
+<script>
+for (const f of document.forms) f.addEventListener('submit', (e) => { e.preventDefault(); window.hits.push(f.id); });
+</script>`;
+
+// The aria-label is only whitespace, so the label is the text.
+const BLANK = `<!doctype html>
+<script>window.hits = [];</script>
+<button id="b-blank" aria-label=" ">Delete</button>
+<script>document.getElementById('b-blank').addEventListener('click', () => window.hits.push('b-blank'));</script>`;
+
+const PAGES = { '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT,
+  '/submitters': SUBMITTERS, '/owners': OWNERS, '/blank': BLANK };
 
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
 // records every request that reaches it. PAGES maps a path to its page, any other path is HOME.
@@ -992,4 +1021,120 @@ test('a websocket open is recorded', async ({ context }) => {
     server.closeAllConnections();
     await new Promise((done) => server.close(done));
   }
+});
+
+test('an overridden body is judged at continue', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null, writes: [{ method: 'GET', url: '/api/items$', body: 'drop' }] });
+  const page = await open(context);
+  let override;
+  await page.route('**/api/items', (route) => route.continue(override));
+
+  // A string, a Buffer (read as UTF-8) and an object (read as its JSON), each carrying the body.
+  for (override of [{ postData: 'drop it' }, { postData: Buffer.from('drop it') }, { postData: { op: 'drop' } }]) {
+    expect(await send(page, 'GET')).toBe('network error');
+  }
+
+  expect(server.seen.filter((s) => s.endsWith('/api/items'))).toEqual([]);
+  expect(guard.record().events).toEqual([write('block', 'GET'), write('block', 'GET'), write('block', 'GET')]);
+});
+
+test('an allowed or observed continue keeps its options', async ({ context }) => {
+  // A server of its own on 127.0.0.1, and the page from its origin, so nothing is faked and
+  // no request can leave the machine.
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(`${req.method} ${req.url} ${req.headers['x-guard'] ?? ''}`.trim());
+    res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><p>Ok</p>');
+  });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  try {
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const guard = await install(context, { policy: 'observe', log: null });
+    const page = await context.newPage();
+    await page.goto(`${origin}/`);
+    seen.length = 0;
+    await page.route('**/method', (route) => route.continue({ method: 'POST' }));
+    await page.route('**/header', (route) => route.continue({ headers: { 'x-guard': 'kept' } }));
+
+    // The observed write leaves as the POST it was rewritten into; the allowed read keeps its header.
+    for (const path of ['/method', '/header']) await page.evaluate((p) => fetch(p).then((r) => r.text()), path);
+    expect(seen).toEqual(['POST /method', 'GET /header kept']);
+    expect(guard.record()).toMatchObject({ blocked: 0, observed: 1, events: [{ kind: 'request', action: 'observe', method: 'POST', url: `${origin}/method` }] });
+  } finally {
+    server.closeAllConnections();
+    await new Promise((done) => server.close(done));
+  }
+});
+
+test('the content type comes from the effective headers', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  await page.route('**/api/items', (route) => route.continue({ method: 'POST', headers: { 'Content-Type': 'text/csv' } }));
+
+  expect(await send(page, 'GET')).toBe('network error');
+  expect(guard.record().events).toEqual([write('block', 'POST', { contentType: 'text/csv' })]);
+});
+
+test('each egress attempt records its own event', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  await page.route('**/api/items', async (route) => {
+    await route.fetch({ method: 'PATCH' }).catch(() => {});
+    return route.continue({ method: 'DELETE' });
+  });
+
+  expect(await send(page, 'GET')).toBe('network error');
+  expect(server.writes()).toEqual([]);
+  expect(guard.record()).toMatchObject({ blocked: 2, events: [write('block', 'PATCH'), write('block', 'DELETE')] });
+});
+
+test('a document blocked at a caller\'s continue gets the 403 page', async ({ context }) => {
+  const server = await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  await page.route('**/api/items', (route) => route.continue());
+
+  await page.click('#go');
+  await expect(page.locator('body')).toHaveText(`write-guard blocked POST ${APP}/api/items`);
+  expect(server.writes()).toEqual([]);
+});
+
+test('the clicked submitter is judged, not the first submit button', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/submitters');
+
+  await page.click('#s-keep');
+  expect(await hits(page)).toEqual(['submit s-keep']);
+  expect(guard.record().blocked).toBe(0);
+
+  await page.click('#s-delete');
+  await expect.poll(() => guard.record().blocked).toBe(1);
+  expect(await hits(page)).toEqual(['submit s-keep']);
+});
+
+test('the submit fallback finds plain, submit and form-owned buttons', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/owners');
+
+  for (const [i, id] of ['o-plain', 'o-typed', 'o-owned'].entries()) {
+    await page.evaluate((f) => document.getElementById(f).requestSubmit(), id);
+    await expect.poll(() => guard.record().blocked, { message: id }).toBe(i + 1);
+    expect(guard.record().events[i], id).toEqual(control('Delete'));
+  }
+  expect(await hits(page)).toEqual([]);
+});
+
+test('a label that is only whitespace is skipped', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/blank');
+
+  await page.click('#b-blank');
+  await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
+  expect(await hits(page)).toEqual([]);
 });
