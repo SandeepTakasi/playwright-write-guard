@@ -248,6 +248,14 @@ test('a harmless label is allowed under every policy', () => {
   }
 });
 
+test('a built-in verb inside a longer word is not destructive', () => {
+  const c = cfg({});
+  assert.equal(decideControl(ctl('Unarchive'), c).action, 'allow');
+  assert.equal(decideControl(ctl('Resend'), c).action, 'allow');
+  assert.equal(decideControl(ctl('Archive'), c).action, 'block');
+  assert.equal(decideControl(ctl('Send'), c).action, 'block');
+});
+
 test('an empty label never matches the label pattern', () => {
   assert.equal(decideControl(ctl(''), cfg()).action, 'allow');
   assert.equal(decideControl(ctl('   '), cfg()).action, 'allow');
