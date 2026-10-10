@@ -128,6 +128,10 @@ test('lists that are not lists throw', () => {
   bad({ controls: { icons: 'fa-bomb' } }, 'controls.icons');
 });
 
+test('allow null is malformed, not treated as absent', () => {
+  assert.throws(() => compileConfig({ allow: null }), /^Error: write-guard: allow: /);
+});
+
 test('a Sig that is not an object throws', () => {
   bad({ allow: ['POST /x'] }, 'allow[0]');
   bad({ writes: [{ method: 'GET', url: 'x' }, null] }, 'writes[1]');
@@ -184,6 +188,12 @@ test('method * in a signature matches any method', () => {
   assert.equal(decideRequest(req('HEAD', 'https://a.test/upload'), c).action, 'block');
 });
 
+test('an OPTIONS signature compiles and matches an OPTIONS request', () => {
+  const c = cfg({ allow: [{ method: 'OPTIONS', url: '/x$' }] });
+  assert.equal(c.allow[0].method, 'OPTIONS');
+  assert.equal(decideRequest(req('OPTIONS', 'https://a.test/x'), c).action, 'allow');
+});
+
 test('allow always wins over the method default and over writes', () => {
   const c = cfg({
     allow: [{ method: 'POST', url: '^https://a[.]test/graphql' }],
@@ -198,6 +208,12 @@ test('a body signature separates a query from a mutation on one URL', () => {
   const c = cfg({ allow: [{ method: 'POST', url: '/graphql$', body: '"query"\\s*:\\s*"\\s*query\\b' }] });
   assert.equal(decideRequest(req('POST', 'https://a.test/graphql', QUERY), c).action, 'allow');
   assert.equal(decideRequest(req('POST', 'https://a.test/graphql', MUTATION), c).action, 'block');
+});
+
+test('a Sig body regex is case-sensitive', () => {
+  const c = cfg({ writes: [{ method: 'GET', url: '/x$', body: 'drop' }] });
+  assert.equal(decideRequest(req('GET', 'https://a.test/x', 'drop'), c).action, 'block');
+  assert.equal(decideRequest(req('GET', 'https://a.test/x', 'DROP'), c).action, 'allow');
 });
 
 test('a Sig with a body never matches a request without one', () => {
