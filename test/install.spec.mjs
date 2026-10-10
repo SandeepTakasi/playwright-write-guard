@@ -155,7 +155,21 @@ const BLANK = `<!doctype html>
 <button id="b-blank" aria-label=" ">Delete</button>
 <script>document.getElementById('b-blank').addEventListener('click', () => window.hits.push('b-blank'));</script>`;
 
-const PAGES = { '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT,
+// One control per page, every app handler attached with addEventListener.
+const TRIMMED = `<!doctype html>
+<script>window.hits = [];</script>
+<button id="tr-delete" aria-label=" Delete ">x</button>
+<script>document.getElementById('tr-delete').addEventListener('click', () => window.hits.push('tr-delete'));</script>`;
+const NESTED = `<!doctype html>
+<script>window.hits = [];</script>
+<div id="ne-row" role="button" aria-label="Row"><button id="ne-delete">Delete</button></div>
+<script>document.getElementById('ne-delete').addEventListener('click', () => window.hits.push('ne-delete'));</script>`;
+const FIRST = `<!doctype html>
+<script>window.hits = [];</script>
+<form id="fi-form"><button>Delete</button><button>Keep</button></form>
+<script>document.getElementById('fi-form').addEventListener('submit', (e) => { e.preventDefault(); window.hits.push('fi-form'); });</script>`;
+
+const PAGES = { '/trimmed': TRIMMED, '/nested': NESTED, '/first': FIRST, '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT,
   '/submitters': SUBMITTERS, '/owners': OWNERS, '/blank': BLANK };
 
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
@@ -314,6 +328,49 @@ test('route.fetch of a write is refused under read-only', async ({ context }) =>
   expect(message).toBe(`write-guard: route.fetch of POST ${APP}/api/items is refused under read-only`);
   expect(server.writes()).toEqual([]);
   expect(guard.record().events).toEqual([write('block', 'POST')]);
+});
+
+test('a refused route.fetch of a document rejects', async ({ context }) => {
+  const server = await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  let message;
+  await page.route('**/api/items', async (route) => {
+    message = await route.fetch().then(() => 'fetched', (e) => e.message);
+    return route.abort();
+  });
+
+  await page.click('#go');
+  await expect.poll(() => message).toBe(`write-guard: route.fetch of POST ${APP}/api/items is refused under read-only`);
+  expect(server.writes()).toEqual([]);
+});
+
+test('an allowed route.fetch returns the response', async ({ context }) => {
+  // route.fetch skips routes, so the page and the API come from a server of its own on 127.0.0.1.
+  const server = createServer((req, res) => {
+    const body = req.url === '/data' ? 'from the server' : '<!doctype html><p>Ok</p>';
+    res.writeHead(200, { 'content-type': req.url === '/data' ? 'text/plain' : 'text/html' }).end(body);
+  });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  try {
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const guard = await install(context, { log: null });
+    const page = await context.newPage();
+    await page.goto(`${origin}/`);
+    let status;
+    await page.route('**/data', async (route) => {
+      const res = await route.fetch();
+      status = res.status();
+      return route.fulfill({ response: res });
+    });
+
+    expect(await page.evaluate(() => fetch('/data').then((r) => r.text()))).toBe('from the server');
+    expect(status).toBe(200);
+    expect(guard.record().blocked).toBe(0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((done) => server.close(done));
+  }
 });
 
 test('under observe an override goes through and is recorded once', async ({ context }) => {
@@ -544,9 +601,9 @@ test('websockets: "block" refuses a socket under either policy', async ({ contex
 
   const closed = await page.evaluate(() => new Promise((resolve) => {
     const ws = new WebSocket('ws://app.test/socket');
-    ws.onclose = () => resolve(true);
+    ws.onclose = (e) => resolve(e.code);
   }));
-  expect(closed).toBe(true);
+  expect(closed).toBe(1008);
   await expect.poll(() => guard.record().blocked).toBe(1);
   const [event] = guard.record().events;
   expect(event).toEqual({ kind: 'request', action: 'block', reason: expect.any(String), url: 'ws://app.test/socket', at: expect.any(String) });
@@ -1135,6 +1192,39 @@ test('a label that is only whitespace is skipped', async ({ context }) => {
   const page = await visit(context, '/blank');
 
   await page.click('#b-blank');
+  await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
+  expect(await hits(page)).toEqual([]);
+});
+
+test('the trimmed label is used in the warning', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/trimmed');
+  const warnings = [];
+  page.on('console', (m) => { if (m.type() === 'warning') warnings.push(m.text()); });
+
+  await page.click('#tr-delete');
+  await expect.poll(() => warnings.length).toBe(1);
+  expect(warnings).toEqual([`write-guard refused "Delete": ${guard.record().events[0].reason}`]);
+  expect(await hits(page)).toEqual([]);
+});
+
+test('the innermost control on the composed path is judged', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/nested');
+
+  await page.click('#ne-delete');
+  await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
+  expect(await hits(page)).toEqual([]);
+});
+
+test('the submit fallback takes the first submit button', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/first');
+
+  await page.evaluate(() => document.getElementById('fi-form').requestSubmit());
   await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
   expect(await hits(page)).toEqual([]);
 });
