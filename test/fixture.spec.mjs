@@ -1,32 +1,42 @@
-// The Playwright Test fixture, end to end in Chromium. Every page and API is served by routes
-// on the fake host https://app.test, so these tests need no network. Specs here use ordinary
-// clicks and fetches: the guard has to stop writes with no help from them.
+// The Playwright Test fixture, end to end in Chromium. Every page and API is served by a real
+// node:http server on 127.0.0.1, so these tests need no outside network and "never reaches the
+// server" is read from what that server actually received. Specs here use ordinary clicks and
+// fetches: the guard has to stop writes with no help from them.
 
 import { request as apiRequest, chromium } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { test, expect } from '../src/fixture.mjs';
 
-const APP = 'https://app.test';
+// The servers a test started, closed after it.
+const servers = [];
 
-// The fake server. Registered on the page (so the guard's wrapper judges first) and recording
-// every request that reaches it.
+test.afterEach(async () => {
+  await Promise.all(servers.splice(0).map((s) => new Promise((done) => { s.close(done); s.closeAllConnections(); })));
+});
+
+// A real server on a free port of 127.0.0.1, recording every request that reaches it. The page
+// loads from its origin, past anything a route in the browser could answer.
 async function serve(page, body) {
   const seen = [];
-  await page.route(`${APP}/**`, (route) => {
-    const req = route.request();
-    const { pathname } = new URL(req.url());
-    seen.push(`${req.method()} ${pathname}`);
-    if (pathname.startsWith('/api/')) return route.fulfill({ status: 200, contentType: 'text/plain', body: 'ok' });
-    if (pathname.endsWith('.js')) return route.fulfill({ status: 200, contentType: 'text/javascript', body: '' });
-    return route.fulfill({ status: 200, contentType: 'text/html', body: `<!doctype html><html><body>${body}</body></html>` });
+  const server = createServer((req, res) => {
+    const { pathname } = new URL(req.url, 'http://127.0.0.1');
+    seen.push(`${req.method} ${pathname}`);
+    req.resume();
+    if (pathname.startsWith('/api/')) return res.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
+    if (pathname.endsWith('.js')) return res.writeHead(200, { 'content-type': 'text/javascript' }).end('');
+    res.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><html><body>${body}</body></html>`);
   });
-  await page.goto(`${APP}/items`);
-  return { seen, writes: () => seen.filter((s) => !s.startsWith('GET ')) };
+  servers.push(server);
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  await page.goto(`${origin}/items`);
+  return { origin, seen, writes: () => seen.filter((s) => !s.startsWith('GET ')) };
 }
 
 const COUNTER = `<script>
@@ -114,10 +124,10 @@ test.describe('read-only', () => {
 
   test('a form submit is blocked and the page shows why', async ({ page }) => {
     const server = await serve(page, '<form method="post" action="/api/items"><button type="submit">Go</button></form>');
-    const response = page.waitForResponse(`${APP}/api/items`);
+    const response = page.waitForResponse(`${server.origin}/api/items`);
     await page.getByRole('button', { name: 'Go' }).click();
     expect((await response).status()).toBe(403);
-    await expect(page.locator('body')).toHaveText(`write-guard blocked POST ${APP}/api/items`);
+    await expect(page.locator('body')).toHaveText(`write-guard blocked POST ${server.origin}/api/items`);
     expect(server.writes()).toEqual([]);
   });
 
@@ -137,9 +147,9 @@ test.describe('read-only', () => {
   });
 
   test('page.request and context.request refuse to send', async ({ page, context }) => {
-    await serve(page, '<p>Items</p>');
-    await expect(page.request.get(`${APP}/api/items`)).rejects.toThrow(/^write-guard: /);
-    await expect(context.request.post(`${APP}/api/items`)).rejects.toThrow(/^write-guard: /);
+    const server = await serve(page, '<p>Items</p>');
+    await expect(page.request.get(`${server.origin}/api/items`)).rejects.toThrow(/^write-guard: /);
+    await expect(context.request.post(`${server.origin}/api/items`)).rejects.toThrow(/^write-guard: /);
   });
 
   test('service workers are blocked', async ({ page, context }) => {
@@ -157,7 +167,7 @@ test.describe('read-only', () => {
 });
 
 test.describe('a config given with test.use is applied as given', () => {
-  test.use({ writeGuardConfig: { allow: [{ method: 'POST', url: '^https://app[.]test/api/read$' }] } });
+  test.use({ writeGuardConfig: { allow: [{ method: 'POST', url: '^http://127[.]0[.]0[.]1:[0-9]+/api/read$' }] } });
 
   test('an allow-listed POST goes through and any other write is blocked', async ({ page }) => {
     const server = await serve(page, '<p>Items</p>');
@@ -222,7 +232,19 @@ test.describe('in a Playwright run of its own', () => {
     mkdirSync(dir, { recursive: true });
     const config = { testDir: '.', testMatch: '*.spec.mjs', retries: 0, workers: 1, use: { headless: true } };
     writeFileSync(join(dir, 'playwright.config.mjs'), `export default ${JSON.stringify(config)};\n`);
-    writeFileSync(join(dir, 'nested.spec.mjs'), `import { test, expect } from ${JSON.stringify(fixture)};\n${spec}`);
+    // `home()` starts a real server for the nested spec and returns its origin; it is closed after each test.
+    const prelude = `import { test, expect } from ${JSON.stringify(fixture)};
+import { createServer } from 'node:http';
+const homes = [];
+const home = async () => {
+  const s = createServer((q, r) => { q.resume(); r.writeHead(200, { 'content-type': 'text/html' }).end('<p>x</p>'); });
+  homes.push(s);
+  await new Promise((ready) => s.listen(0, '127.0.0.1', ready));
+  return 'http://127.0.0.1:' + s.address().port;
+};
+test.afterEach(async () => { await Promise.all(homes.splice(0).map((s) => new Promise((done) => { s.close(done); s.closeAllConnections(); }))); });
+`;
+    writeFileSync(join(dir, 'nested.spec.mjs'), `${prelude}${spec}`);
     const inherited = Object.entries(process.env).filter(([k]) => !/^(PW_|PLAYWRIGHT_|TEST_|WRITE_GUARD_|FORCE_COLOR)/.test(k));
     const done = await run(process.execPath, [cli, 'test', '-c', dir, '--reporter=json', `--output=${join(dir, 'results')}`], {
       cwd: dir,
@@ -239,8 +261,7 @@ test.describe('in a Playwright run of its own', () => {
 
   const PROBE = `
     const post = async (page) => {
-      await page.route('https://app.test/**', (r) => r.fulfill({ status: 200, contentType: 'text/html', body: '<p>x</p>' }));
-      await page.goto('https://app.test/');
+      await page.goto(await home());
       return page.evaluate(() => fetch('/api/items', { method: 'POST', body: '{}' }).then((r) => r.status, () => 'failed'));
     };`;
 
@@ -293,8 +314,7 @@ test.describe('in a Playwright run of its own', () => {
           let earlier;
           test('blocks a write', async ({ page }, info) => {
             earlier = info;
-            await page.route('https://app.test/**', (r) => r.fulfill({ status: 200, contentType: 'text/html', body: '<p>x</p>' }));
-            await page.goto('https://app.test/');
+            await page.goto(await home());
             expect(await page.evaluate(() => fetch('/api/items', { method: 'POST', body: '{}' }).then((r) => r.status, () => 'failed'))).toBe('failed');
           });
           test('recorded the block', () => {
