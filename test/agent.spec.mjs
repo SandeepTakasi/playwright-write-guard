@@ -337,7 +337,7 @@ test.describe('the command', () => {
 
   test('an unknown flag or a flag missing its value prints the usage line and exits 1', () => {
     for (const args of [['--nope'], ['--port'], ['--config']]) {
-      const r = spawnSync(process.execPath, [BIN, ...args], { encoding: 'utf8' });
+      const r = spawnSync(process.execPath, [BIN, ...args], { encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL' });
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]');
     }
