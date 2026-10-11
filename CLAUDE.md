@@ -19,10 +19,12 @@ Guide for contributors and coding agents working in this repository.
 ## Tests
 
 - Every guard rule needs a test that fails when the rule is reverted or weakened. Check a new rule by breaking it on purpose in a scratch copy and watching a test fail; a green suite alone proves nothing.
-- Tests never reach the network: serve every page and API with routes on `https://app.test`. `context.request` and `page.request` do not pass through context routes (Playwright 1.64), so never send to `app.test` through an unlocked request client. A route registered after the guard that fulfills requests is a mock, not the server: count writes on a real 127.0.0.1 server or a route registered before `install`.
+- Tests never reach the network: serve every page and API with routes on `https://app.test`. `context.request`, `page.request` and `route.fetch()` do not pass through context routes (Playwright 1.64), so never send to `app.test` through them; use a real 127.0.0.1 server instead. A route registered after the guard that fulfills requests is a mock, not the server: count writes on a real 127.0.0.1 server or a route registered before `install`.
 - In-page control tests attach the app's handlers with `addEventListener`. A plain element with only an `onclick` attribute is no longer a control, so a test written with `onclick` attributes on non-control elements tests nothing.
 - A test that spawns the command gives it a timeout, so a regression that keeps the command running fails the test instead of hanging the run.
+- A WebSocket test serves its page from the echo server's own `http://127.0.0.1` origin: a page on `https://app.test` cannot open `ws://127.0.0.1` (mixed content).
 - The launcher's title test reads Playwright's internal `PWTEST_SERVER_REGISTRY` directory. After a Playwright upgrade, check it still exists before trusting that test.
+- Start Playwright MCP from a temporary directory, never the repo: it writes a `.playwright-mcp/` folder into its working directory.
 
 ## Writing style
 
@@ -54,3 +56,5 @@ It must print nothing. If it prints anything, stop and fix the match before comm
 ## Publishing
 
 - The maintainer runs `npm publish` in an interactive terminal: the npm account uses security-key 2FA, which an agent cannot complete. Before it, run the history-wide check, confirm HEAD is pushed, and read `npm pack --dry-run` (only `src`, `bin`, `types`, `README.md`, `LICENSE`, `package.json`).
+- If `npm whoami` fails, log in again with `npm login --auth-type=web` (it opens the browser; no one-time code to type).
+- Release notes list every breaking change, including changes to the type declarations, and the version bump follows them (a minor version while below 1.0).
