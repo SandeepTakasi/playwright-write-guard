@@ -506,6 +506,32 @@ test.afterEach(async () => { await Promise.all(homes.splice(0).map((s) => new Pr
     expect(existsSync(join(testInfo.outputPath('project'), 'write-guard.jsonl'))).toBe(false);
   });
 
+  test('a new context in a test writes no log file', async ({}, testInfo) => {
+    const results = await playwrightRun(testInfo, {
+      spec: `
+        test.describe.serial('blocked write in a new context', () => {
+          test.use({ writeGuardConfig: { policy: 'read-only', log: 'write-guard.jsonl' } });
+          let earlier;
+          test('blocks a write', async ({ browser }, info) => {
+            earlier = info;
+            const made = await browser.newContext();
+            // Refused before it is sent, so port 9 is never reached.
+            const message = await made.request.post('http://127.0.0.1:9/api/items').then(() => 'sent', (e) => e.message);
+            expect(message).toBe('write-guard: POST http://127.0.0.1:9/api/items through APIRequestContext is refused under read-only');
+            await made.close();
+          });
+          test('recorded the block', () => {
+            const record = JSON.parse(earlier.attachments.find((a) => a.name === 'write-guard-2.json').body.toString());
+            expect(record.blocked).toBe(1);
+          });
+        });`,
+    });
+    expect(results['blocks a write'].status).toBe('passed');
+    expect(results['recorded the block'].status).toBe('passed');
+    // The nested run's working directory is its project directory; a honoured log would be there.
+    expect(existsSync(join(testInfo.outputPath('project'), 'write-guard.jsonl'))).toBe(false);
+  });
+
   test('a test that allows service workers is refused', async ({}, testInfo) => {
     const results = await playwrightRun(testInfo, {
       spec: `

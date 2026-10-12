@@ -1681,3 +1681,122 @@ test('a navigation link is not judged by its text', async ({ context }) => {
   await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
   expect(await hits(page)).toEqual(['v-help', 'v-nav', 'v-icon']);
 });
+
+test('URLSearchParams and array params are judged as Playwright sends them', async ({ context }) => {
+  const server = await listen();
+  await install(context, { log: null });
+  const url = `${server.origin}/api/q`;
+
+  // A URLSearchParams is the query; an array goes through Object.entries, so [['op', 'delete']] is `0=op%2Cdelete`.
+  const sends = [
+    [new URLSearchParams('op=delete'), '?op=delete'],
+    [[['op', 'delete']], '?0=op%2Cdelete'],
+  ];
+  for (const [params, query] of sends) {
+    expect(await outcome(context.request.post(url, { params }))).toBe(refusal('POST', `${url}${query}`));
+    // The URL judged is the URL sent: a GET with the same params reaches the server with that query.
+    expect(await outcome(context.request.get(url, { params }))).toBe('ok');
+    expect(server.lines().at(-1)).toBe(`GET /api/q${query}`);
+  }
+});
+
+test('a form send with a captured request is judged with no body', async ({ context }) => {
+  const server = await listen();
+  await serve(context);
+  const target = `${server.origin}/api/x`;
+  // Only a POST whose body starts with "query" is allowed.
+  const guard = await install(context, { log: null, logBodies: true, allow: [{ method: 'POST', url: '/api/x$', body: '^query' }] });
+  const page = await open(context);
+  const captured = page.waitForRequest((r) => r.method() === 'POST');
+  await post(page, '/api/items', 'query');
+  const req = await captured;
+
+  // The captured request's own body matches the allow entry.
+  expect(await outcome(context.request.fetch(target, { request: req }))).toBe('ok');
+  expect(server.seen.map((s) => [s.line, s.body])).toEqual([['POST /api/x', 'query']]);
+  // Playwright sends the form, not that body, so no body is judged: the entry cannot match.
+  expect(await outcome(context.request.fetch(target, { request: req, form: { a: '1' } }))).toBe(refusal('POST', target));
+  expect(server.lines()).toEqual(['POST /api/x']);
+  const events = guard.record().events.filter((e) => e.via === 'request-client');
+  expect(events).toHaveLength(1);
+  expect(events[0]).not.toHaveProperty('body');
+});
+
+test('a relative route.fetch URL is judged after the context baseURL', async ({ browser }) => {
+  const server = await listen();
+  const context = await browser.newContext({ baseURL: server.origin });
+  try {
+    // Only the absolute URL is allowed; a raw relative one matches nothing.
+    const guard = await install(context, { log: null, allow: [{ method: 'POST', url: '^http://127[.]0[.]0[.]1:[0-9]+/api/fetched$' }] });
+    const page = await context.newPage();
+    await page.goto(`${server.origin}/`);
+    let message;
+    await page.route('**/api/trigger', async (route) => {
+      message = await route.fetch({ url: '/api/fetched', method: 'POST' }).then(() => 'fetched', (e) => e.message);
+      return route.fulfill({ body: 'mocked' });
+    });
+
+    expect(await page.evaluate(() => fetch('/api/trigger').then((r) => r.text()))).toBe('mocked');
+    expect(message).toBe('fetched');
+    expect(server.lines()).toEqual(['GET /', 'POST /api/fetched']);
+    expect(guard.record()).toMatchObject({ blocked: 0, observed: 0 });
+  } finally {
+    await context.close();
+  }
+});
+
+// Sends each frame in order, then a text frame to hear its echo, which proves the frames before it were handled.
+const echoFrames = (page, url, frames) => page.evaluate(([u, fs]) => new Promise((resolve, reject) => {
+  const ws = new WebSocket(u);
+  ws.addEventListener('open', () => {
+    for (const f of fs) ws.send(typeof f === 'string' ? f : new Uint8Array(f));
+    ws.send('hello');
+  });
+  ws.addEventListener('message', (e) => { resolve(e.data); ws.close(); });
+  ws.addEventListener('error', () => reject(new Error('socket error')));
+}), [url, frames]);
+
+test('a recorded frame is cut at 500 characters', async ({ context }) => {
+  const echo = await listenEcho();
+  const url = `ws://${echo.host}/socket`;
+  const guard = await install(context, { log: null, logBodies: true, websocketWrites: ['^deleteItem '] });
+  const page = await context.newPage();
+  await page.goto(`http://${echo.host}/`);
+  const frame = `deleteItem ${'a'.repeat(600)}`;
+
+  // The long frame is refused, so the echo server only ever sees the short one.
+  expect(await echoFrames(page, url, [frame])).toBe('hello');
+  expect(echo.frames).toEqual(['hello']);
+  const [, blocked] = guard.record().events;
+  expect(blocked).toMatchObject({ kind: 'websocket', action: 'block', url });
+  expect(blocked.frame).toHaveLength(500);
+  expect(blocked.frame).toBe(frame.slice(0, 500));
+});
+
+test('a binary frame is never judged', async ({ context }) => {
+  const echo = await listenEcho();
+  const url = `ws://${echo.host}/socket`;
+  const guard = await install(context, { log: null, logBodies: true, websocketWrites: ['^deleteItem '] });
+  const page = await context.newPage();
+  await page.goto(`http://${echo.host}/`);
+
+  // Bytes that read as a matching text frame are still not a text frame: forwarded, not recorded.
+  const bytes = [...Buffer.from('deleteItem 1')];
+  expect(await echoFrames(page, url, [bytes])).toBe('hello');
+  expect(echo.frames).toEqual(['binary 12', 'hello']);
+  expect(guard.record().events).toEqual([{ kind: 'websocket', action: 'open', url, at: expect.any(String) }]);
+});
+
+test('a Node fetch string body is judged', async ({ context }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null, logBodies: true, allow: [{ method: 'POST', url: '/api/q$', body: '^query' }] });
+  const guarded = guard.guardFetch(fetch);
+  const url = `${server.origin}/api/q`;
+  const go = (body) => guarded(url, { method: 'POST', body }).then((r) => r.text(), (e) => e.message);
+
+  // The body is what the allow entry and the event see: a matching one goes through, any other is refused and recorded.
+  expect(await go('query')).toBe('ok');
+  expect(await go('mutation')).toBe(refusal('POST', url, 'fetch'));
+  expect(server.seen.map((s) => [s.line, s.body])).toEqual([['POST /api/q', 'query']]);
+  expect(guard.record().events).toEqual([sent('block', 'POST', url, 'node-fetch', { body: 'mutation' })]);
+});

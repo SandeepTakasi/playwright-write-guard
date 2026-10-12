@@ -150,6 +150,24 @@ test('allow and suspect events, events without a method, other kinds and bad lin
   assert.equal(r.stderr, '1 x PATCH https://a.test/kept\n');
 });
 
+test('a next-action header on any event in a group keeps the hint', () => {
+  const r = run([
+    ev({ method: 'POST', url: 'https://a.test/x', headerNames: ['next-action'] }),
+    ev({ method: 'POST', url: 'https://a.test/x', headerNames: ['content-type'] }),
+    ev({ method: 'POST', url: 'https://a.test/x' }),
+  ]);
+  assert.equal(r.stderr, '3 x POST https://a.test/x: carries next-action, pin its action IDs with a headers entry\n');
+});
+
+test('bare carriage return line ends are split', () => {
+  const lines = [ev({ method: 'POST', url: 'https://a.test/x' }), ev({ method: 'PUT', url: 'https://a.test/y' })];
+  const lf = run(lines);
+  const cr = run([lines.join('\r')]);
+  assert.deepEqual(cr.allow.map((e) => e.method), ['POST', 'PUT']);
+  assert.equal(cr.stdout, lf.stdout);
+  assert.equal(cr.stderr, lf.stderr);
+});
+
 test('a second argument is a usage error even when the first file is readable', () => {
   const r = run([ev({ method: 'POST', url: 'https://a.test/x' })]);
   const file = join(r.dir, 'log.jsonl');
