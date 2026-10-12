@@ -16,10 +16,10 @@ What it guarantees, and what it does not:
 
 - **Enforced:** every HTTP request the pages of a guarded context send is judged at the network layer, whatever triggered it. This is the main layer: a "Continue" button that submits a payment still sends a request, and that request is judged. WebSockets are the exception: by default a socket opens and each open is recorded as a `websocket` event, but its messages, writes included, are not judged or logged (`websockets: "block"` refuses the sockets the guard routes, and apps that need a socket then do not load).
 - **Heuristic:** which requests count as writes, and which controls count as destructive.
-  - Requests are judged by method, unless your `allow` and `writes` signatures say otherwise. Apps that read over POST (GraphQL, search APIs, server actions, long polling) stop working until those endpoints are allow-listed. A run under `observe` lists them (method, URL and content type; set `logBodies: true` to add the first 500 characters of each body, which can hold credentials, so it is off by default). GETs with side effects (logout, unsubscribe, `?action=delete`) pass with no event unless a `writes` signature names them.
+  - Requests are judged by method, unless your `allow` and `writes` signatures say otherwise. Apps that read over POST (GraphQL, search APIs, server actions, long polling) stop working until those endpoints are allow-listed. A run under `observe` lists them (method, URL and content type; set `logBodies: true` to add the first 500 characters of each body, which can hold credentials, so it is off by default). It does not show request headers, so reads told apart only by a header have to be found in the app's own code or network panel. GETs with side effects (logout, unsubscribe, `?action=delete`) pass with no event unless a `writes` signature names them.
   - Controls are judged by label, and only real controls: buttons, links with an `href`, elements with a button, menuitem, link or tab role, and submit, button or image inputs. The click check is a second layer that stops the app before it starts a write. Its built-in verb list is short (save, delete, remove, publish, send, archive, pay, purchase, log out, sign out, logout): it still refuses some harmless controls such as "Remove filter" or "Save search", and misses writing controls such as "Place order" or "Add to cart". If it gets in the way, set `defaultControls: false` and name your app's own verbs in `controls.text`.
 - **Not covered:** anything outside the guarded context, such as other contexts, request clients the guard cannot reach, and code that removes the guard. See [What it cannot see](#what-it-cannot-see). The boundary is a restricted account: give the run credentials that cannot write, and use the guard to catch mistakes before they reach it.
-- **Cost:** Playwright turns off the HTTP cache while a route is installed, so every load fetches every asset again. Service workers are blocked, so an app that waits for `navigator.serviceWorker.ready` hangs.
+- **Cost:** Playwright turns off the HTTP cache while a route is installed, so every load fetches every asset again. Service workers are blocked, so an app that waits for `navigator.serviceWorker.ready` hangs. Every WebSocket a page opens goes through Playwright's routing, which makes socket traffic noticeably slower.
 
 See it work end to end, with a local page and a local server, in the walkthrough at [demo/README.md](demo/README.md) (`node demo/run.mjs`).
 
@@ -53,7 +53,7 @@ Tests that only read through the page keep working. Under read-only, these chang
 - While a test runs, `browser.newContext()`, `browser.newPage()` and the global `fetch` in the test process throw, so tests with several users, or that post results from inside a test, need another approach.
 - A test can mock a write: a `page.route` handler that `fulfill`s or `abort`s a POST runs, and the request never leaves the browser. A handler that passes the request on with `continue()` or `route.fetch()` is judged at that point, overrides included, so the write is still blocked. A mock is not the server: count writes on a real local server, not through a route that fulfills them.
 - Blocked requests other than page navigations are aborted, which the page's console reports as `net::ERR_BLOCKED_BY_CLIENT` errors, so a test that asserts a clean console needs to filter those out.
-- Blocked writes do not fail a test. Check the `blocked` count in the `write-guard.json` attachment if you want them to.
+- Blocked writes do not fail a test. Check the `blocked` count in the `write-guard.json` attachment if you want them to. A write that one of your own routes fulfills or aborts is a mock and is not counted, so a broad stub such as `page.route('**/api/**', ...)` can hide writes from that count: keep stubs narrow.
 
 The fixture guards each test's context, created with `serviceWorkers: 'block'`. By default it reads `write-guard.config.json` from the directory you run Playwright in. Every key is optional; a small example that lets two named GraphQL queries through and blocks everything else, mutations included:
 
@@ -64,14 +64,16 @@ The fixture guards each test's context, created with `serviceWorkers: 'block'`. 
     {
       "method": "POST",
       "url": "^https://app[.]example[.]test/graphql$",
-      "body": "\"operationName\":\"(ListItems|GetItem)\""
+      "body": "^\\{\"operationName\":\"(ListItems|GetItem)\""
     }
   ],
   "controls": { "icons": ["icon-trash"] }
 }
 ```
 
-Without the `body` pattern, that signature would allow every request to the URL, mutations included. The pattern trusts your app's operation names, so list only names that read. Reads that differ from writes only in a header, such as Next.js server actions, can be allow-listed with a `headers` entry, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/items$", "headers": { "next-action": "^[0-9a-f]+$" } }`. Header names compare case-insensitively and each value is a regex tested against that header on the request.
+Without the `body` pattern, that signature would allow every request to the URL, mutations included. The pattern is anchored with `^\{`, so it matches only a single operation whose body starts with its name: a batched request (a JSON array) never matches, and neither does a body that puts `operationName` later. Check that your client sends `operationName` first, or the reads stay blocked (the safe direction). The pattern trusts your app's operation names, so list only names that read, and never leave a pattern unanchored.
+
+Reads that differ from writes only in a header, such as Next.js server actions, can be allow-listed with a `headers` entry that names the exact action IDs that read, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/items$", "headers": { "next-action": "^(7f3a9c21|1b2e44d0)$" } }`. Every server action sends a `next-action` header, writes included, so a pattern that matches any ID allows every action; and action IDs can change between builds, so re-check them after a deploy. Header names compare case-insensitively and each value is a regex tested against that header on the request.
 
 To set the config in the test file instead, use `test.use`:
 
@@ -91,7 +93,7 @@ WRITE_GUARD_CONFIG=/path/to/write-guard.config.json npx playwright test -c confi
 
 Pick one mode for a given browser. Using both at once is refused: the second guard throws `write-guard: this context is already guarded by another process; use one mode, not both`, and Playwright MCP then fails every tool call with that message.
 
-Config mode depends on denying the agent its code-running and routing tools; the example below is for Claude Code. If your agent cannot deny tools that way, use launcher mode. Both modes were checked with Playwright MCP 0.0.83 driving the demo app: the agent's Delete click was refused in the page, its `fetch` DELETE was blocked at the network, and the server received no writes.
+Config mode depends on denying the agent its code-running and routing tools; the example below is for Claude Code. If your agent cannot deny tools that way, use launcher mode. Both modes were checked with Playwright MCP 0.0.83 driving the demo app: the agent's Delete click was refused in the page, its `fetch` DELETE was blocked at the network, and the server received no writes. The agent sees a refused click only as a warning count in the click's result: the reason is in the console messages (Playwright MCP's `browser_console_messages`), and a blocked request only reports `Failed to fetch`.
 
 ### Config mode: the `initPage` entry
 
@@ -171,10 +173,10 @@ Logging in is a write, so under read-only a login form is blocked: the page show
   });
   ```
 
-  `state.json` holds a live session: keep it out of version control.
+  `state.json` holds a live session: keep it out of version control. If the app renews its session token with a POST, the session expires during the run and the app looks broken ("session expired"); allow-list that refresh endpoint as below.
 - **Allow-list the login endpoints**, in any mode: `{ "method": "POST", "url": "^https://app[.]example[.]test/login$" }`, plus the token refresh endpoint if a session must last. Keep these narrow: everything they match is let through.
 - **Playwright MCP in config mode:** start it with `--isolated --storage-state <file>` to begin already logged in (Playwright MCP reads a storage state only for isolated sessions).
-- **Launcher mode** has no storage-state option yet: allow-list the login endpoints, or use config mode.
+- **Launcher mode** takes no context or launch options yet (no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials): allow-list the login endpoints, or use config mode.
 
 ## The audit log
 
@@ -200,7 +202,7 @@ The guard judges requests the browser sends through its context and clicks the p
 - WebSocket messages: under the default `websockets: "allow"`, each socket a page opens is recorded as a `websocket` event, but its messages (writes included, as in LiveView, Socket.IO or GraphQL subscriptions) are not judged or logged. `"block"` refuses every socket the guard routes, and apps that need a socket then do not load.
 - WebSockets opened by dedicated or shared workers: they are not routed, so they are neither recorded nor blocked, under either setting.
 - A caller's own `routeWebSocket` registered after the guard in the same process takes precedence: no open is recorded, and `websockets: "block"` does not refuse that socket. In launcher mode an attached client cannot register its own `routeWebSocket`: Playwright throws `Another client is already routing WebSockets`.
-- The page's `WebSocket`: under both settings Playwright replaces it with its routed implementation, which an app that inspects or subclasses it can notice.
+- The page's `WebSocket`: under both settings Playwright replaces it with its routed implementation, which an app that inspects or subclasses it can notice, and which makes socket traffic noticeably slower.
 - WebRTC and WebTransport.
 - Redirects after the first URL: only the request the page made is judged, not where the server redirects it.
 - Drag-and-drop, and pointer or mouse handlers that act before `click`.
@@ -210,6 +212,8 @@ The guard judges requests the browser sends through its context and clicks the p
 - Reads that send no query text (persisted GraphQL queries without an operation name): when nothing in the method, URL, headers or body tells such a read from a write, a signature that allows the endpoint allows its mutations too.
 - Request bodies in the log unless `logBodies` is `true`, and request headers other than the content type: events record the method, URL and content type, so an `observe` run shows which endpoints were written to, not with what. `logBodies: true` adds the first 500 characters of each body, and is off by default because bodies can hold credentials and personal data.
 - In launcher mode, mocking a blocked write from a client's `context.route`: that handler runs after the guard's catch-all, so it never receives a blocked write. A client's `page.route` can mock one.
+- Writes that one of your own routes fulfills or aborts: they never leave the browser and are not recorded, so a broad stub such as `page.route('**/api/**', ...)` can hide writes from the log and from the `blocked` count.
+- The launcher's browser and context options: it takes no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials.
 - The HTTP cache: Playwright turns it off while a route is installed, so every load fetches every asset again.
 - Service workers: they are blocked, so `register()` resolves but `navigator.serviceWorker.ready` never settles, and an app that waits for it hangs.
 - In launcher mode, any context other than `contexts()[0]`: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
@@ -225,6 +229,7 @@ The guard judges requests the browser sends through its context and clicks the p
 It also refuses too much, which is the safe direction but can stop a run:
 
 - The built-in verbs match harmless controls too, because a label matches as a whole word anywhere in it ("Remove filter", "Save search", "Send feedback", "Pay attention").
+- Links are judged by their text too: a link whose text holds a built-in verb ("Delete a repository" in a help page, "Archive" in a navigation bar) is refused in the page, although following it only reads.
 - A real control whose label contains a verb is refused even when it only reads. Text fields are never refused (a typed space or Enter goes through; Enter still submits a form implicitly, and that submit is judged by its submit button).
 
 It is a safety net, not a security boundary. A restricted test account is the boundary: give the run credentials that cannot write, and use the guard to catch the mistakes that slip past.
@@ -462,7 +467,7 @@ npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--
 - WebSocket messages: under the default `websockets: "allow"`, each socket a page opens is recorded as a `websocket` event, but its messages (writes included) are not judged or logged. `"block"` refuses every socket the guard routes.
 - WebSockets opened by dedicated or shared workers: they are not routed, so they are neither recorded nor blocked, under either setting.
 - A caller's own `routeWebSocket` registered after the guard in the same process takes precedence: no open is recorded, and `websockets: "block"` does not refuse that socket. In launcher mode an attached client cannot register its own `routeWebSocket`: Playwright throws `Another client is already routing WebSockets`.
-- The page's `WebSocket`: under both settings Playwright replaces it with its routed implementation.
+- The page's `WebSocket`: under both settings Playwright replaces it with its routed implementation, which is noticeably slower.
 - WebRTC and WebTransport.
 - Redirects after the first URL: only the request the page made is judged, not where the server redirects it.
 - Drag-and-drop, and pointer or mouse handlers that act before `click`.
@@ -472,6 +477,8 @@ npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--
 - Reads that send no query text (persisted GraphQL queries without an operation name): when nothing in the method, URL, headers or body tells such a read from a write, a signature that allows the endpoint allows its mutations too.
 - Request bodies unless `logBodies` is `true`, and request headers other than the content type: events record the method, URL and content type. `logBodies` is off by default because bodies can hold credentials and personal data.
 - In launcher mode, mocking a blocked write from a client's `context.route`: that handler runs after the guard's catch-all, so it never receives a blocked write. A client's `page.route` can mock one.
+- Writes that one of your own routes fulfills or aborts: they never leave the browser and are not recorded, so a broad stub such as `page.route('**/api/**', ...)` can hide writes from the log and from the `blocked` count.
+- The launcher's browser and context options: it takes no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials.
 - The HTTP cache: Playwright turns it off while a route is installed.
 - Service workers: `register()` resolves but `navigator.serviceWorker.ready` never settles.
 - Any context other than `contexts()[0]` in launcher mode: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
@@ -483,6 +490,7 @@ npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--
 - Controls the page does not judge: anchors without `href`, `<input type=reset>`, `summary`, plain elements that have only an `onclick` attribute or a `tabindex` (rows, cards), controls inside closed shadow roots, and plain text outside any control. The network layer still judges any request they send. Open shadow roots are judged through the event's composed path, using the shadow host's label when the control has none. An image input is never found by the submit fallback, so a `requestSubmit()` with no submitter on a form whose only submit control is an image input is not judged in the page (the network layer still judges the request).
 - A document loaded with `page.setContent()`: the guard's in-page listeners do not carry over into it, so a destructive click there is not refused in the page. The network layer still judges any request it sends.
 - Node's own `http`, `https` and `net` modules in the test process.
+- Links whose text holds a built-in verb are refused in the page even when following them only reads (a help page link "Delete a repository", a navigation item "Archive").
 
 It is a safety net, not a security boundary. A restricted test account is the boundary.
 
