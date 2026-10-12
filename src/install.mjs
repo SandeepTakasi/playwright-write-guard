@@ -3,13 +3,15 @@
 // The network side judges each request at egress, where it would leave the browser: a
 // catch-all context route registered first (so it runs last), and the continue and fetch of
 // every route a caller registers later. A caller's handler sees every request and may fulfill
-// or abort it. The page side is an init script built from the decision core's own source,
-// with capture-phase listeners that refuse destructive controls before the app sees them.
+// or abort it, which is recorded as a mock. Sends through the context's request client, and
+// through clients and fetch functions wrapped with the handle, are judged before they are
+// made. The page side is an init script built from the decision core's own source, with
+// capture-phase listeners that refuse destructive controls before the app sees them.
 // No playwright import: everything goes through the context it is handed.
 
 import { existsSync, promises as fsp, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { compileConfig, decideControl, decideRequest } from './core.mjs';
+import { compileConfig, decideControl, decideFrame, decideRequest, decideSuspect } from './core.mjs';
 
 const BINDING = '__writeGuardReport';
 const ALREADY = 'write-guard: this context is already guarded by another process; use one mode, not both';
@@ -26,23 +28,26 @@ export async function install(context, config = {}) {
 
 async function setup(context, raw, cfg) {
   const events = [];
-  const counts = { routed: 0, blocked: 0, observed: 0 };
+  // By event action; a websocket `open` counts in none of them.
+  const counts = { block: 0, observe: 0, mocked: 0, suspect: 0 };
+  let routed = 0;
   const logPath = cfg.log === null ? null : resolve(cfg.log);
   let pending = Promise.resolve();
 
   const record = () => ({
     installed: true,
     policy: cfg.policy,
-    routed_requests: counts.routed,
-    blocked: counts.blocked,
-    observed: counts.observed,
-    events: events.map((e) => ({ ...e })),
+    routed_requests: routed,
+    blocked: counts.block,
+    observed: counts.observe,
+    mocked: counts.mocked,
+    suspect: counts.suspect,
+    events: structuredClone(events),
   });
   const emit = (event) => {
     const e = { ...event, at: new Date().toISOString() };
     events.push(e);
-    if (e.action === 'block') counts.blocked++;
-    else if (e.action === 'observe') counts.observed++;
+    if (Object.hasOwn(counts, e.action)) counts[e.action]++;
     if (logPath) {
       const line = `${JSON.stringify(e)}\n`;
       pending = pending.then(() => fsp.appendFile(logPath, line))
@@ -61,41 +66,43 @@ async function setup(context, raw, cfg) {
     throw err;
   }
 
-  // Judges the request as it would leave through `kind` ('catch-all', 'continue' or 'fetch'):
-  // each of method, URL and body from `options` when given, else as the request reached this
-  // point (route.request() reflects earlier fallback overrides). Headers are a whole set,
-  // never merged, as Playwright replaces them. Then blocks it or lets it proceed.
+  const baseURL = context._options?.baseURL;
+  // Requests that reached egress through a caller's route.fetch: judged there, so a later
+  // fulfill or abort of them is not a mock.
+  const fetched = new WeakSet();
   const counted = new WeakSet();
+  // Judges the request as it would leave through `kind` ('catch-all', 'continue' or 'fetch'),
+  // then blocks it or lets it proceed. route.fetch sends what Playwright merges for its
+  // request client; the others send the request as it reached this point with `options`
+  // applied.
   const egress = async (route, options, kind) => {
     const req = route.request();
-    const o = options ?? {};
-    const method = String(o.method || req.method()).toUpperCase();
-    const url = o.url || req.url();
-    const p = o.postData;
-    let body = null;
-    if (p != null) body = typeof p === 'string' ? p : Buffer.isBuffer(p) ? p.toString('utf8') : JSON.stringify(p);
-    else try { body = req.postData(); } catch { /* an undecodable body is judged as none */ }
-    const headers = {};
-    for (const [k, val] of Object.entries(o.headers || req.headers())) headers[k.toLowerCase()] = String(val);
-    if (!counted.has(req)) { counted.add(req); counts.routed++; }
-
-    const v = decideRequest({ method, url, body, headers }, cfg);
-    if (v.action !== 'allow') {
-      emit({
-        kind: 'request', action: v.action, reason: v.reason, method, url,
-        ...(headers['content-type'] === undefined ? {} : { contentType: headers['content-type'] }),
-        ...(cfg.logBodies && body != null ? { body: body.slice(0, 500) } : {}),
-      });
+    let r;
+    if (kind === 'fetch') {
+      fetched.add(req);
+      r = clientRequest({ request: req, data: options?.postData, ...options }, baseURL);
+    } else {
+      r = browserRequest(req, options);
     }
-    if (v.action === 'block') {
-      if (kind === 'fetch') throw new Error(`write-guard: route.fetch of ${method} ${url} is refused under read-only`);
+    if (!counted.has(req)) { counted.add(req); routed++; }
+
+    if (judge(r, cfg, emit) === 'block') {
+      if (kind === 'fetch') throw new Error(`write-guard: route.fetch of ${r.method} ${r.url} is refused under read-only`);
       if (req.resourceType() === 'document') {
-        return route.fulfill({ status: 403, contentType: 'text/html; charset=utf-8', body: blockedPage(method, url) });
+        return route.fulfill({ status: 403, contentType: 'text/html; charset=utf-8', body: blockedPage(r.method, r.url) });
       }
       return route.abort('blockedbyclient');
     }
     // fallback, never continue, so handlers registered behind the catch-all still run.
     return kind === 'catch-all' ? route.fallback() : route[kind](options);
+  };
+  // A caller's fulfill or abort: recorded when the request, as that handler received it, is a write.
+  const mock = (route) => {
+    const req = route.request();
+    if (fetched.has(req)) return;
+    const r = browserRequest(req);
+    const v = decideRequest(r, cfg);
+    if (v.action !== 'allow') emit(requestEvent('mocked', v.reason, r, cfg));
   };
 
   // A predicate, not a glob, so no caller's unroute(url) can name it.
@@ -105,24 +112,36 @@ async function setup(context, raw, cfg) {
     if (cfg.websockets === 'block') {
       emit({ kind: 'request', action: 'block', reason: 'websockets is "block": every WebSocket is refused', url: ws.url() });
       await ws.close({ code: 1008, reason: 'write-guard' }).catch(() => {});
-    } else {
-      emit({ kind: 'websocket', action: 'open', url: ws.url() });
-      ws.connectToServer();
+      return;
     }
+    emit({ kind: 'websocket', action: 'open', url: ws.url() });
+    const server = ws.connectToServer();
+    if (!cfg.websocketWrites.length) return;
+    // Only frames the page sends; the server's messages still reach the page untouched.
+    ws.onMessage((message) => {
+      const v = decideFrame(message, cfg);
+      if (v.action !== 'allow') {
+        emit({ kind: 'websocket', action: v.action, reason: v.reason, url: ws.url(), ...(cfg.logBodies ? { frame: message.slice(0, 500) } : {}) });
+      }
+      if (v.action !== 'block') server.send(message);
+    });
   });
 
   await context.addInitScript({ content: pageScript(raw) });
 
-  patchRoutes(context, egress);
+  // One wrapper for the context's client; a page's `request` is the same object.
+  const client = judgeClient(context.request, cfg, { baseURL, emit });
+  const pinRequest = (target) => Object.defineProperty(target, 'request', { get: () => client, configurable: true });
+  pinRequest(context);
+  patchRoutes(context, egress, mock);
   if (cfg.policy === 'read-only') {
-    lockRequest(context);
     // The context's dialog event is emitted before any page's, so this runs ahead of every
     // listener a caller adds later; their accept() then finds the dialog already handled.
     context.on('dialog', (d) => d.dismiss().catch(() => {}));
   }
   const onPage = (page) => {
-    patchRoutes(page, egress);
-    if (cfg.policy === 'read-only') lockRequest(page);
+    patchRoutes(page, egress, mock);
+    pinRequest(page);
   };
   for (const p of context.pages()) onPage(p);
   context.on('page', onPage);
@@ -135,19 +154,161 @@ async function setup(context, raw, cfg) {
       do { last = pending; await last; } while (last !== pending);
       return record();
     },
+    guardRequestClient: (target, { baseURL: base } = {}) => judgeClient(target, cfg, { baseURL: base, emit }),
+    guardFetch: (fetchFn) => async (...args) => {
+      const r = fetchRequest(args[0], args[1]);
+      if (judge(r, cfg, emit, 'node-fetch') === 'block') throw new Error(refused(r, 'fetch'));
+      return fetchFn(...args);
+    },
   };
+}
+
+// Judges one effective request: emits a write's `block` or `observe` event, or a `suspect`
+// event for an allowed GET or HEAD that looks side effecting. Returns the decideRequest action.
+function judge(r, cfg, emit, via) {
+  const v = decideRequest(r, cfg);
+  if (v.action !== 'allow') {
+    emit(requestEvent(v.action, v.reason, r, cfg, via));
+  } else {
+    const s = decideSuspect(r, cfg);
+    if (s.suspect) emit(requestEvent('suspect', s.reason, r, cfg, via));
+  }
+  return v.action;
+}
+
+// `r.headers` has lower-case names, each once, so its keys are the header names.
+const requestEvent = (action, reason, r, cfg, via) => ({
+  kind: 'request', action, reason, method: r.method, url: r.url,
+  ...(via ? { via } : {}),
+  ...(r.headers['content-type'] === undefined ? {} : { contentType: r.headers['content-type'] }),
+  headerNames: Object.keys(r.headers).sort(),
+  ...(cfg.logBodies && r.body != null ? { body: r.body.slice(0, 500) } : {}),
+});
+
+const refused = (r, via) => `write-guard: ${r.method} ${r.url} through ${via} is refused under read-only`;
+
+// A browser request at a route: each of method, URL and body from `options` when given, else
+// as the request reached this point (route.request() reflects earlier fallback overrides).
+// Headers are a whole set, never merged, as Playwright replaces them.
+function browserRequest(req, options) {
+  const o = options ?? {};
+  const method = String(o.method || req.method()).toUpperCase();
+  const url = o.url || req.url();
+  const p = o.postData;
+  let body = null;
+  if (p != null) body = typeof p === 'string' ? p : Buffer.isBuffer(p) ? p.toString('utf8') : JSON.stringify(p);
+  else try { body = req.postData(); } catch { /* an undecodable body is judged as none */ }
+  const headers = {};
+  for (const [k, val] of Object.entries(o.headers || req.headers())) headers[k.toLowerCase()] = String(val);
+  return { method, url, body, headers };
+}
+
+// Playwright's isString.
+const isString = (v) => typeof v === 'string' || v instanceof String;
+const parses = (s) => { try { JSON.parse(s); return true; } catch { return false; } };
+const parseURL = (...args) => { try { return new URL(...args); } catch { return null; } };
+
+// The effective request of an APIRequestContext send, read from the options `m` that
+// Playwright 1.64 merges before it sends, the way it reads them.
+function clientRequest(m, baseURL) {
+  const req = m.request;
+  const method = String(m.method || req?.method() || 'GET').toUpperCase();
+
+  const raw = m.url !== undefined ? m.url : req.url();
+  const u = (baseURL ? parseURL(raw, baseURL) : null) ?? parseURL(raw);
+  let url = String(raw);
+  if (u) {
+    const p = m.params;
+    if (typeof p === 'string' || p instanceof URLSearchParams) {
+      if (String(p)) u.search = String(p);
+    } else if (p !== null && typeof p === 'object') {
+      for (const [k, v] of Object.entries(p)) if (v !== undefined) u.searchParams.append(k, String(v));
+    }
+    u.hash = '';
+    url = u.href;
+  }
+
+  // As for...in enumerates them; the last of names equal after lower-casing is what is sent.
+  const h = m.headers || req?.headers();
+  const headers = {};
+  let jsonType = null;
+  for (const name in h ?? {}) {
+    const value = h[name];
+    if (value === undefined) continue;
+    const k = name.toLowerCase();
+    if (k === 'content-type' && jsonType === null) jsonType = value === 'application/json';
+    headers[k] = String(value);
+  }
+
+  let body = null;
+  const d = m.data;
+  if (d !== undefined) {
+    // Read as Playwright reads it: Buffer.from takes a String object's valueOf().
+    if (isString(d)) body = jsonType && !(typeof d === 'string' && parses(d)) ? JSON.stringify(d) : Buffer.from(d, 'utf8').toString('utf8');
+    else if (Buffer.isBuffer(d)) body = d.toString('utf8');
+    else body = JSON.stringify(d) ?? null;
+  } else if (!m.form && !m.multipart && req) {
+    body = req.postDataBuffer()?.toString('utf8') ?? null;
+  }
+  return { method, url, body, headers };
+}
+
+// The effective request of a Node fetch(input, init) call.
+function fetchRequest(input, init) {
+  const isRequest = input instanceof globalThis.Request;
+  const method = String(init?.method || (isRequest ? input.method : '') || 'GET').toUpperCase();
+  const raw = typeof input === 'string' ? input : isRequest ? input.url : String(input);
+  const u = parseURL(raw);
+  if (u) u.hash = '';
+  const h = init?.headers !== undefined ? init.headers : isRequest ? input.headers : undefined;
+  const headers = {};
+  if (h !== undefined) for (const [k, v] of new Headers(h)) headers[k] = v;
+  return { method, url: u ? u.href : raw, body: typeof init?.body === 'string' ? init.body : null, headers };
+}
+
+// `client` with each send judged with the compiled `cfg`, its events passed to `emit`.
+// Everything that is not a send reads through to the raw client, with methods bound to it,
+// so Playwright's own calls (route.fetch reaches _innerFetch) are not judged again here.
+function judgeClient(client, cfg, { baseURL, emit }) {
+  return new Proxy(client, {
+    get(obj, prop) {
+      if (typeof prop === 'string' && SENDS.has(prop)) {
+        return async (...args) => {
+          const [a, options] = args;
+          const m = { url: isString(a) ? a : undefined, request: isString(a) ? undefined : a, ...options };
+          if (prop !== 'fetch') m.method = prop.toUpperCase();
+          const r = clientRequest(m, baseURL);
+          if (judge(r, cfg, emit, 'request-client') === 'block') throw new Error(refused(r, 'APIRequestContext'));
+          // The raw client's own method: its named methods call its own fetch, not this wrapper's.
+          return obj[prop](...args);
+        };
+      }
+      const v = Reflect.get(obj, prop, obj);
+      return typeof v === 'function' ? v.bind(obj) : v;
+    },
+  });
+}
+
+/**
+ * Internal, not part of the API: `client` with each send judged with the compiled config `cfg`
+ * and recorded nowhere, for a request client no guard records.
+ */
+export function _judgeRequestClient(client, cfg, { baseURL } = {}) {
+  return judgeClient(client, cfg, { baseURL, emit: () => {} });
 }
 
 const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const blockedPage = (method, url) => `<!doctype html><html><head><meta charset="utf-8"><title>write-guard</title></head>`
   + `<body><p>write-guard blocked ${escapeHtml(method)} ${escapeHtml(url)}</p></body></html>`;
 
-// The route a caller's handler gets: continue and fetch are egress points, judged first, and
-// everything else (fulfill, abort, fallback) is the original Route's.
-function judgedRoute(r, egress) {
+// The route a caller's handler gets: continue and fetch are egress points, judged first;
+// fulfill and abort are mock points, recorded first and then called unchanged; everything
+// else (fallback) is the original Route's.
+function judgedRoute(r, egress, mock) {
   return new Proxy(r, {
     get(obj, prop) {
       if (prop === 'continue' || prop === 'fetch') return async (options) => egress(obj, options, prop);
+      if (prop === 'fulfill' || prop === 'abort') return async (...args) => { mock(obj); return obj[prop](...args); };
       const v = Reflect.get(obj, prop, obj);
       return typeof v === 'function' ? v.bind(obj) : v;
     },
@@ -156,14 +317,14 @@ function judgedRoute(r, egress) {
 
 // Every handler a caller registers gets a judged route; unroute and unrouteAll remove only
 // the caller's own handlers.
-function patchRoutes(target, egress) {
+function patchRoutes(target, egress, mock) {
   const route = target.route.bind(target);
   const unroute = target.unroute.bind(target);
   const tracked = [];
   const sameUrl = (a, b) => a === b
     || (a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags);
   target.route = (url, handler, options) => {
-    const wrapped = (r, request) => handler(judgedRoute(r, egress), request);
+    const wrapped = (r, request) => handler(judgedRoute(r, egress, mock), request);
     tracked.push({ url, handler, wrapped });
     // The returned disposable calls target.unroute(url, wrapped), which lands below.
     return route(url, wrapped, options);
@@ -180,29 +341,16 @@ function patchRoutes(target, egress) {
   };
 }
 
-// The request object stays readable (Playwright's own teardown reads it); only sends throw.
-function lockRequest(target) {
-  const original = target.request;
-  const locked = new Proxy(original, {
-    get(obj, prop) {
-      if (typeof prop === 'string' && SENDS.has(prop)) {
-        return async () => { throw new Error(`write-guard: ${prop} through APIRequestContext is refused under read-only`); };
-      }
-      const v = Reflect.get(obj, prop, obj);
-      return typeof v === 'function' ? v.bind(obj) : v;
-    },
-  });
-  Object.defineProperty(target, 'request', { get: () => locked, configurable: true });
-}
-
 // The page side. A capture-phase listener must decide synchronously, so the decision core
 // runs in the page, compiled from the same raw config.
 function pageScript(raw) {
   return `(() => {
+  // Captured before any page script runs, so the page cannot swap them out.
+  const URL = window.URL;
   const compileConfig = ${compileConfig.toString()};
   const decideControl = ${decideControl.toString()};
+  const decideSuspect = ${decideSuspect.toString()};
   const cfg = compileConfig(${JSON.stringify(raw ?? {})});
-  // Captured before any page script runs, so the page cannot swap them out.
   const bind = window.${BINDING};
   const preventDefault = Function.prototype.call.bind(Event.prototype.preventDefault);
   const stopImmediatePropagation = Function.prototype.call.bind(Event.prototype.stopImmediatePropagation);
@@ -229,10 +377,32 @@ function pageScript(raw) {
     }
     return out;
   };
+  // The URL an a[href] navigates to, or null for a control judged by its label: anything that
+  // is not an a[href], and an a[href] whose trimmed href is empty or starts with '#', or that
+  // resolves to a javascript: URL.
+  const linkTarget = (el) => {
+    if (el.localName !== 'a' || !el.hasAttribute('href')) return null;
+    const href = el.getAttribute('href').trim();
+    if (href === '' || href.startsWith('#')) return null;
+    try {
+      const u = new URL(href, document.baseURI);
+      return u.protocol === 'javascript:' ? null : u.href;
+    } catch (_) {
+      return href;
+    }
+  };
   const judge = (el, e) => {
     if (!(el instanceof Element)) return;
     const label = labelOf(el);
-    const v = decideControl({ label, icons: iconsOf(el) }, cfg);
+    const url = linkTarget(el);
+    let v;
+    if (url === null) {
+      v = decideControl({ label, icons: iconsOf(el) }, cfg);
+    } else {
+      // A link that navigates is judged by its URL only: a suspect one is destructive.
+      const s = decideSuspect({ method: 'GET', url }, cfg);
+      v = s.suspect ? { action: cfg.policy === 'observe' ? 'observe' : 'block', reason: s.reason } : { action: 'allow' };
+    }
     if (v.action === 'allow') return;
     if (v.action === 'block') {
       preventDefault(e);

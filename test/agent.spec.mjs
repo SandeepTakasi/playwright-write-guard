@@ -457,13 +457,24 @@ test.describe('the initPage entry', () => {
     expect(guard.record()).toMatchObject({ installed: true, policy: 'read-only', blocked: 2 });
   });
 
-  test('locks the request fixture of the page it is handed', async ({ context, page }) => {
-    const server = await serve(context);
-    await initPage({ page });
+  test('judges the request client of the page it is handed', async ({ page }) => {
+    // A request client skips routes, so it sends to a real server on 127.0.0.1.
+    const seen = [];
+    const server = createServer((req, res) => { seen.push(`${req.method} ${req.url}`); res.end('ok'); });
+    await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+    try {
+      const url = `http://127.0.0.1:${server.address().port}/api/items`;
+      const guard = await initPage({ page });
 
-    await expect(page.request.post(`${APP}/api/items`, { data: {} }))
-      .rejects.toThrow('write-guard: post through APIRequestContext is refused under read-only');
-    expect(server.writes()).toEqual([]);
+      await expect(page.request.post(url, { data: {} }))
+        .rejects.toThrow(`write-guard: POST ${url} through APIRequestContext is refused under read-only`);
+      expect(await (await page.request.get(url)).text()).toBe('ok');
+      expect(seen).toEqual(['GET /api/items']);
+      expect(guard.record()).toMatchObject({ blocked: 1, events: [{ kind: 'request', action: 'block', method: 'POST', url, via: 'request-client' }] });
+    } finally {
+      server.closeAllConnections();
+      await new Promise((done) => server.close(done));
+    }
   });
 
   test('called twice, or for every tab, it installs once', async ({ context, page }) => {

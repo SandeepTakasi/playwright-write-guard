@@ -1,6 +1,6 @@
 // The installer, end to end in Chromium. Every page and API is served by routes on the fake
-// host https://app.test, and the socket test by a server of its own on 127.0.0.1, so these
-// tests need no network.
+// host https://app.test, and request clients, route.fetch and sockets (which skip routes) by
+// servers of their own on 127.0.0.1, so these tests need no network.
 
 import { test, expect } from '@playwright/test';
 import { createHash } from 'node:crypto';
@@ -169,8 +169,96 @@ const FIRST = `<!doctype html>
 <form id="fi-form"><button>Delete</button><button>Keep</button></form>
 <script>document.getElementById('fi-form').addEventListener('submit', (e) => { e.preventDefault(); window.hits.push('fi-form'); });</script>`;
 
+// Links: a navigating one is judged by its URL, a non-navigating one by its label. The app
+// sees a click when its own listener runs; each one stops the navigation itself.
+const LINKS = `<!doctype html>
+<script>window.hits = [];</script>
+<a id="l-out" href="/logout">Log out</a>
+<a id="l-quiet" href="/items?action=drop">Open</a>
+<a id="l-plain" href="/items/7">Open item</a>
+<a id="l-hash" href=" #top">Delete</a>
+<a id="l-js" href="javascript:void 0">Delete</a>
+<a id="l-tab" href="java&#9;script:void 0">Delete</a>
+<a id="l-empty" href="">Delete</a>
+<a id="l-go" href="/logout?next=1">Bye</a>
+<script>
+for (const a of document.querySelectorAll('a')) a.addEventListener('click', (e) => { if (a.id !== 'l-go') e.preventDefault(); window.hits.push(a.id); });
+</script>`;
+
+// Navigating links whose text holds a built-in verb, and a [role=link] that keeps the label rule.
+const NAV = `<!doctype html>
+<script>window.hits = [];</script>
+<a id="v-help" href="/help/repositories">Delete a repository</a>
+<a id="v-nav" href="/archive">Archive</a>
+<a id="v-icon" href="/items/7" class="icon-trash">x</a>
+<span id="v-role" role="link">Delete</span>
+<script>
+for (const id of ['v-help', 'v-nav', 'v-icon', 'v-role']) {
+  document.getElementById(id).addEventListener('click', (e) => { e.preventDefault(); window.hits.push(id); });
+}
+</script>`;
+
 const PAGES = { '/trimmed': TRIMMED, '/nested': NESTED, '/first': FIRST, '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT,
-  '/submitters': SUBMITTERS, '/owners': OWNERS, '/blank': BLANK };
+  '/submitters': SUBMITTERS, '/owners': OWNERS, '/blank': BLANK, '/links': LINKS, '/nav': NAV };
+
+// Real servers on 127.0.0.1, closed after each test. Request clients, route.fetch and Node's
+// fetch skip routes, so what they send is read from what such a server received.
+const servers = [];
+test.afterEach(async () => {
+  for (const s of servers.splice(0)) {
+    s.closeAllConnections();
+    await new Promise((done) => s.close(done));
+  }
+});
+
+// Records each request as `METHOD path` (with its query), its headers and its body; answers
+// paths holding /api/ with "ok" and anything else with a small page.
+async function listen() {
+  const seen = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      seen.push({ line: `${req.method} ${req.url}`, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') });
+      const api = req.url.includes('/api/');
+      res.writeHead(200, { 'content-type': api ? 'text/plain' : 'text/html' }).end(api ? 'ok' : '<!doctype html><p>Ok</p>');
+    });
+  });
+  servers.push(server);
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  return { origin: `http://127.0.0.1:${server.address().port}`, seen, lines: () => seen.map((s) => s.line) };
+}
+
+// A WebSocket echo server on 127.0.0.1 that also serves a page, so a page from its own origin
+// can open a socket to it. It records each text frame it receives and echoes it back.
+async function listenEcho() {
+  const frames = [];
+  const sockets = [];
+  const server = createServer((req, res) => res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><p>Socket</p>'));
+  server.on('upgrade', (req, socket) => {
+    sockets.push(socket);
+    socket.on('error', () => {});
+    const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    // Short masked frames only (under 126 bytes), several per chunk.
+    socket.on('data', (d) => {
+      for (let at = 0; at + 6 <= d.length;) {
+        const opcode = d[at] & 0x0f;
+        const length = d[at + 1] & 0x7f;
+        const mask = d.subarray(at + 2, at + 6);
+        const payload = Buffer.from(d.subarray(at + 6, at + 6 + length).map((byte, i) => byte ^ mask[i % 4]));
+        at += 6 + length;
+        if (opcode === 1) {
+          frames.push(payload.toString('utf8'));
+          socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]));
+        } else if (opcode === 2) frames.push(`binary ${payload.length}`);
+      }
+    });
+  });
+  servers.push({ closeAllConnections: () => { for (const s of sockets) s.destroy(); server.closeAllConnections(); }, close: (done) => server.close(done) });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  return { host: `127.0.0.1:${server.address().port}`, frames };
+}
 
 // The fake server. Registered before `install`, so it is not the caller's to remove, and it
 // records every request that reaches it. PAGES maps a path to its page, any other path is HOME.
@@ -197,7 +285,10 @@ async function open(context) {
 const send = (page, method) => page.evaluate((m) => fetch('/api/items', { method: m, body: m === 'GET' ? undefined : '{}' })
   .then((r) => r.text(), () => 'network error'), method);
 const hits = (page) => page.evaluate(() => window.hits);
-const write = (action, method, extra = {}) => ({ kind: 'request', action, reason: expect.any(String), method, url: `${APP}/api/items`, ...extra, at: expect.any(String) });
+const write = (action, method, extra = {}) => ({ kind: 'request', action, reason: expect.any(String), method, url: `${APP}/api/items`, headerNames: expect.any(Array), ...extra, at: expect.any(String) });
+// A request-client or Node fetch event.
+const sent = (action, method, url, via, extra = {}) => ({ kind: 'request', action, reason: expect.any(String), method, url, via, headerNames: [], ...extra, at: expect.any(String) });
+const refusal = (method, url, via = 'APIRequestContext') => `write-guard: ${method} ${url} through ${via} is refused under read-only`;
 // What fetch sends as the content type of a string body.
 const TEXT_TYPE = 'text/plain;charset=UTF-8';
 const control = (label) => ({ kind: 'control', action: 'block', reason: expect.any(String), label, at: expect.any(String) });
@@ -219,10 +310,8 @@ async function withEnv(vars, fn) {
   try { set(vars); return await fn(); } finally { set(saved); }
 }
 
-// An unlocked APIRequestContext refuses a negative maxRetries in its own option check, before
-// sending anything; a locked one answers with the guard's refusal first. No request leaves.
-const sendThrough = (client, method) => client[method](`${APP}/api/items`, { maxRetries: -1 }).then(() => 'sent', (e) => e.message);
-const OWN_CHECK = "'maxRetries' must be greater than or equal to '0'";
+// The outcome of one send: the response text, or the rejection's message.
+const outcome = (p) => p.then((r) => r.text(), (e) => e.message);
 
 test('blocks a write, records it, and lets reads through', async ({ context }) => {
   const server = await serve(context);
@@ -238,8 +327,8 @@ test('blocks a write, records it, and lets reads through', async ({ context }) =
   expect(record).toMatchObject({ installed: true, policy: 'read-only', blocked: 2, observed: 0 });
   expect(record.routed_requests).toBeGreaterThanOrEqual(4);
   expect(record.events).toEqual([
-    { kind: 'request', action: 'block', reason: expect.any(String), method: 'POST', url: `${APP}/api/items`, contentType: TEXT_TYPE, at: expect.any(String) },
-    { kind: 'request', action: 'block', reason: expect.any(String), method: 'DELETE', url: `${APP}/api/items`, contentType: TEXT_TYPE, at: expect.any(String) },
+    { kind: 'request', action: 'block', reason: expect.any(String), method: 'POST', url: `${APP}/api/items`, contentType: TEXT_TYPE, headerNames: expect.arrayContaining(['content-type']), at: expect.any(String) },
+    { kind: 'request', action: 'block', reason: expect.any(String), method: 'DELETE', url: `${APP}/api/items`, contentType: TEXT_TYPE, headerNames: expect.arrayContaining(['content-type']), at: expect.any(String) },
   ]);
   expect(new Date(record.events[0].at).toISOString()).toBe(record.events[0].at);
 });
@@ -531,14 +620,18 @@ test('a URL rewritten by continue() or fallback() is judged as the new URL', asy
   expect(await send(page, 'GET')).toBe('network error');
 
   expect(server.seen.filter((s) => s.includes('/api/'))).toEqual([]);
-  const blocked = { kind: 'request', action: 'block', reason: expect.any(String), method: 'GET', url: danger, at: expect.any(String) };
+  const blocked = { kind: 'request', action: 'block', reason: expect.any(String), method: 'GET', url: danger, headerNames: expect.any(Array), at: expect.any(String) };
   expect(guard.record().events).toEqual([blocked, blocked]);
 });
 
-test('install locks the request of a page that already exists', async ({ context, page }) => {
-  await install(context, { log: null });
-  await expect(page.request.post(`${APP}/api/items`)).rejects
-    .toThrow('write-guard: post through APIRequestContext is refused under read-only');
+test('install judges the request client of a page that already exists', async ({ context, page }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null });
+  const url = `${server.origin}/api/items`;
+  expect(await outcome(page.request.post(url))).toBe(refusal('POST', url));
+  expect(await outcome(page.request.get(url))).toBe('ok');
+  expect(server.lines()).toEqual(['GET /api/items']);
+  expect(guard.record().events).toEqual([sent('block', 'POST', url, 'request-client')]);
 });
 
 test('the 403 page HTML-escapes the URL', async ({ context }) => {
@@ -617,16 +710,184 @@ test('a second install returns the same handle', async ({ context }) => {
   expect(second.record().policy).toBe('read-only');
 });
 
-test('read-only locks APIRequestContext send methods', async ({ context }) => {
-  await install(context, { log: null });
+test('a request client GET goes through and its write is judged', async ({ context }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null });
   const page = await context.newPage();
-  await expect(context.request.post(`${APP}/api/items`)).rejects
-    .toThrow('write-guard: post through APIRequestContext is refused under read-only');
-  await expect(page.request.get(`${APP}/api/items`)).rejects
-    .toThrow('write-guard: get through APIRequestContext is refused under read-only');
-  await expect(page.request.fetch(`${APP}/api/items`)).rejects
-    .toThrow('write-guard: fetch through APIRequestContext is refused under read-only');
-  expect(typeof context.request.storageState).toBe('function');
+  const url = `${server.origin}/api/items`;
+
+  // A page's client is its context's, one wrapper, so one send is one event.
+  expect(page.request).toBe(context.request);
+  expect(await outcome(context.request.get(url))).toBe('ok');
+  expect(await outcome(page.request.post(url, { data: '{}' }))).toBe(refusal('POST', url));
+  expect(await outcome(page.request.fetch(url, { method: 'delete' }))).toBe(refusal('DELETE', url));
+  expect(server.lines()).toEqual(['GET /api/items']);
+
+  const record = guard.record();
+  expect(record).toMatchObject({ blocked: 2, observed: 0, mocked: 0, suspect: 0, routed_requests: 0 });
+  expect(record.events).toEqual([sent('block', 'POST', url, 'request-client'), sent('block', 'DELETE', url, 'request-client')]);
+  // Everything that is not a send reads through to the raw client.
+  expect(typeof (await context.request.storageState()).cookies).toBe('object');
+});
+
+test('every send method is judged under read-only', async ({ context, page }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null });
+  const url = `${server.origin}/api/items`;
+  for (const client of [context.request, page.request]) {
+    for (const method of ['get', 'head']) expect(await outcome(client[method](url))).toBe(method === 'get' ? 'ok' : '');
+    expect(await outcome(client.fetch(url))).toBe('ok');
+    for (const method of ['post', 'put', 'patch', 'delete']) {
+      expect(await outcome(client[method](url))).toBe(refusal(method.toUpperCase(), url));
+    }
+    expect(await outcome(client.fetch(url, { method: 'POST' }))).toBe(refusal('POST', url));
+  }
+  // Each send was judged once: the named methods call the raw client's fetch, not the wrapper's.
+  expect(server.lines()).toEqual(Array(2).fill(['GET /api/items', 'HEAD /api/items', 'GET /api/items']).flat());
+  expect(guard.record().blocked).toBe(10);
+  expect(guard.record().events).toHaveLength(10);
+});
+
+test('a relative request client URL is judged after baseURL and params', async ({ browser, playwright }) => {
+  const server = await listen();
+  const base = `${server.origin}/app/`;
+  const context = await browser.newContext({ baseURL: base });
+  try {
+    // The installer reads the private option Playwright keeps the context's baseURL in.
+    expect(context._options.baseURL).toBe(base);
+    const config = { log: null, writes: [{ method: 'GET', url: '^http://127[.]0[.]0[.]1:[0-9]+/app/api/do[?]x=1$' }, { method: 'GET', url: '^api/raw$' }] };
+    const guard = await install(context, config);
+    const target = `${server.origin}/app/api/do?x=1`;
+
+    // Each of these sends GET /app/api/do?x=1, the anchored writes signature.
+    const sends = [
+      () => context.request.get('api/do', { params: { x: 1, y: undefined } }),
+      () => context.request.get('api/do#frag', { params: { x: '1' } }),
+      () => context.request.get('api/do?y=2', { params: 'x=1' }),
+      () => context.request.get('api/do?x=1', { params: '' }),
+      () => context.request.get('api/do?x=1', { params: new URLSearchParams() }),
+      () => context.request.get('api/do?x=1', { params: 7 }),
+      () => context.request.fetch('/app/api/do?x=1#top'),
+    ];
+    for (const s of sends) expect(await outcome(s())).toBe(refusal('GET', target));
+    expect(server.lines()).toEqual([]);
+    expect(guard.record().events).toEqual(Array(sends.length).fill(sent('block', 'GET', target, 'request-client')));
+
+    // A harmless relative URL is resolved the same way and sent.
+    expect(await outcome(context.request.get('api/ok', { params: { x: 1 } }))).toBe('ok');
+    expect(server.lines()).toEqual(['GET /app/api/ok?x=1']);
+
+    // guardRequestClient on a client of its own takes the baseURL it is given.
+    const own = await playwright.request.newContext();
+    try {
+      const wrapped = guard.guardRequestClient(own, { baseURL: base });
+      expect(await outcome(wrapped.get('api/do', { params: { x: 1 } }))).toBe(refusal('GET', target));
+      // An invalid baseURL: the URL is parsed alone, and params still apply.
+      const invalid = guard.guardRequestClient(own, { baseURL: 'not a url' });
+      expect(await outcome(invalid.get(`${server.origin}/app/api/do`, { params: { x: 1 } }))).toBe(refusal('GET', target));
+      // Without one, a relative URL is judged as the raw string.
+      const bare = guard.guardRequestClient(own);
+      expect(await outcome(bare.get('api/raw'))).toBe(refusal('GET', 'api/raw'));
+      expect(guard.record().events.slice(-3)).toEqual([...Array(2).fill(sent('block', 'GET', target, 'request-client')), sent('block', 'GET', 'api/raw', 'request-client')]);
+    } finally {
+      await own.dispose();
+    }
+    expect(server.lines()).toEqual(['GET /app/api/ok?x=1']);
+  } finally {
+    await context.close();
+  }
+});
+
+test('a captured request in the options is judged as Playwright merges it', async ({ context }) => {
+  const server = await listen();
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  // A DELETE the page sent, captured: Playwright sends its method when the options carry it.
+  const captured = page.waitForRequest((r) => r.method() === 'DELETE');
+  await send(page, 'DELETE');
+  const del = await captured;
+  const harmless = `${server.origin}/api/harmless`;
+  const other = `${server.origin}/api/other`;
+
+  expect(await outcome(context.request.fetch(harmless, { request: del }))).toBe(refusal('DELETE', harmless));
+  expect(await outcome(context.request.fetch(del, { url: harmless }))).toBe(refusal('DELETE', harmless));
+  // options.url replaces the first argument.
+  expect(await outcome(context.request.post(harmless, { url: other }))).toBe(refusal('POST', other));
+  expect(await outcome(context.request.get(harmless, { url: other }))).toBe('ok');
+
+  // The same merge at a caller's route.fetch.
+  let message;
+  await page.route('**/api/items', async (route) => {
+    message = await route.fetch({ url: harmless, request: del }).then(() => 'fetched', (e) => e.message);
+    return route.fulfill({ body: 'mocked' });
+  });
+  expect(await send(page, 'GET')).toBe('mocked');
+  expect(message).toBe(`write-guard: route.fetch of DELETE ${harmless} is refused under read-only`);
+
+  // Only the harmless GET reached the server.
+  expect(server.lines()).toEqual(['GET /api/other']);
+  expect(guard.record().events.map((e) => [e.action, e.method, e.url, e.via])).toEqual([
+    ['block', 'DELETE', `${APP}/api/items`, undefined],
+    ['block', 'DELETE', harmless, 'request-client'],
+    ['block', 'DELETE', harmless, 'request-client'],
+    ['block', 'POST', other, 'request-client'],
+    ['block', 'DELETE', harmless, undefined],
+  ]);
+});
+
+test('a request client body is judged as Playwright sends it', async ({ context }) => {
+  const server = await listen();
+  const url = `${server.origin}/api/q`;
+  const guard = await install(context, { log: null, logBodies: true, allow: [{ method: 'POST', url: '/api/q$', body: '^"?query' }] });
+  const read = () => server.seen.map((s) => s.body);
+
+  // A String object is sent as its valueOf(), whatever its toString() says.
+  const tricky = new String('mutation');
+  tricky.toString = () => 'query';
+  expect(await outcome(context.request.post(url, { data: tricky }))).toBe(refusal('POST', url));
+  expect(await outcome(context.request.post(url, { data: new String('query') }))).toBe('ok');
+  // A string that does not parse as JSON under exactly application/json is sent as its JSON.
+  expect(await outcome(context.request.post(url, { data: 'query', headers: { 'Content-Type': 'application/json' } }))).toBe('ok');
+  // A Buffer as UTF-8, an object as its JSON.
+  expect(await outcome(context.request.post(url, { data: Buffer.from('query') }))).toBe('ok');
+  expect(await outcome(context.request.post(url, { data: { q: 'query' } }))).toBe(refusal('POST', url));
+  // The re-encoding check reads the first content-type entry; the event carries the last.
+  for (const types of [['application/json', 'text/plain'], ['text/plain', 'application/json']]) {
+    const headers = { 'Content-Type': types[0], 'content-type': types[1] };
+    expect(await outcome(context.request.post(url, { data: 'mutation', headers }))).toBe(refusal('POST', url));
+  }
+  expect(read()).toEqual(['query', '"query"', 'query']);
+  const typed = (body, contentType) => sent('block', 'POST', url, 'request-client', { body, contentType, headerNames: ['content-type'] });
+  expect(guard.record().events).toEqual([
+    sent('block', 'POST', url, 'request-client', { body: 'mutation' }),
+    sent('block', 'POST', url, 'request-client', { body: '{"q":"query"}' }),
+    typed('"mutation"', 'text/plain'),
+    typed('mutation', 'application/json'),
+  ]);
+
+  // A String object as the first argument is judged, then refused by Playwright itself.
+  expect(await outcome(context.request.get(new String(url)))).toContain('First argument must be either URL string or Request');
+  expect(await outcome(context.request.post(new String(url)))).toBe(refusal('POST', url));
+  expect(read()).toHaveLength(3);
+});
+
+test('Node fetch is judged through guardFetch', async ({ context }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null });
+  const guarded = guard.guardFetch(fetch);
+  const url = `${server.origin}/api/items`;
+  const go = (input, init) => guarded(input, init).then((r) => r.text(), (e) => e.message);
+
+  expect(await go(url)).toBe('ok');
+  expect(await go(new URL(`${url}#top`), { method: 'post', body: 'x', headers: [['X-A', '1'], ['x-a', '2']] })).toBe(refusal('POST', url, 'fetch'));
+  expect(await go(new Request(url, { method: 'DELETE', headers: { 'X-B': '1' } }))).toBe(refusal('DELETE', url, 'fetch'));
+  expect(server.lines()).toEqual(['GET /api/items']);
+  expect(guard.record().events).toEqual([
+    sent('block', 'POST', url, 'node-fetch', { headerNames: ['x-a'] }),
+    sent('block', 'DELETE', url, 'node-fetch', { headerNames: ['x-b'] }),
+  ]);
+  expect(guard.record().routed_requests).toBe(0);
 });
 
 test('a context another process guards is refused, and nothing is installed', async ({ context }) => {
@@ -674,17 +935,6 @@ test('loadConfig reads a path, then WRITE_GUARD_CONFIG, and honours WRITE_GUARD_
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
-});
-
-test('every send method is refused under read-only', async ({ context, page }) => {
-  const server = await serve(context);
-  await install(context, { log: null });
-  for (const client of [context.request, page.request]) {
-    for (const method of ['fetch', 'get', 'post', 'put', 'patch', 'delete', 'head']) {
-      expect(await sendThrough(client, method)).toBe(`write-guard: ${method} through APIRequestContext is refused under read-only`);
-    }
-  }
-  expect(server.seen).toEqual([]);
 });
 
 test('each control kind is judged', async ({ context }) => {
@@ -780,15 +1030,20 @@ test('a refused override aborts with blockedbyclient', async ({ context }) => {
   expect(server.writes()).toEqual([]);
 });
 
-test('observe neither locks request clients nor dismisses dialogs', async ({ context, page }) => {
+test('observe records request client writes and does not dismiss dialogs', async ({ context, page }) => {
   await serve(context);
-  await install(context, { policy: 'observe', log: null });
+  const server = await listen();
+  const guard = await install(context, { policy: 'observe', log: null });
   const later = await open(context);
+  const url = `${server.origin}/api/items`;
 
   // `page` existed before install, `later` was opened after it.
   for (const client of [context.request, page.request, later.request]) {
-    expect(await sendThrough(client, 'post')).toContain(OWN_CHECK);
+    expect(await outcome(client.post(url, { data: 'x', headers: { 'Content-Type': 'text/plain' } }))).toBe('ok');
   }
+  expect(server.lines()).toEqual(Array(3).fill('POST /api/items'));
+  expect(guard.record()).toMatchObject({ blocked: 0, observed: 3 });
+  expect(guard.record().events).toEqual(Array(3).fill(sent('observe', 'POST', url, 'request-client', { contentType: 'text/plain', headerNames: ['content-type'] })));
   later.on('dialog', (d) => d.accept());
   expect(await later.evaluate(() => confirm('Delete everything?'))).toBe(true);
 });
@@ -835,21 +1090,57 @@ test('an empty WRITE_GUARD_POLICY is ignored', async ({}, testInfo) => {
   });
 });
 
-test('a caller can fulfill or abort a write', async ({ context }) => {
+test('a mocked write is recorded as mocked', async ({ context, browser }) => {
   const server = await serve(context);
-  const guard = await install(context, { log: null });
+  const guard = await install(context, { log: null, logBodies: true });
   const page = await open(context);
   const routed = guard.record().routed_requests;
 
+  // A caller can still mock a write; it is recorded as the handler received it.
   await page.route('**/api/items', (route) => route.fulfill({ status: 201, body: 'mocked' }));
   expect(await send(page, 'POST')).toBe('mocked');
+  expect(await send(page, 'GET')).toBe('mocked');
   await page.unrouteAll();
   await context.route('**/api/items', (route) => route.abort('failed'));
   expect(await send(page, 'DELETE')).toBe('network error');
+  // An earlier fallback override is what the mocking handler received.
+  await page.route('**/api/items', (route) => route.fallback({ method: 'PUT', postData: 'changed' }));
+  expect(await send(page, 'GET')).toBe('network error');
+  await page.unrouteAll();
+  await context.unrouteAll();
 
-  // Neither reached an egress: nothing left the browser, nothing is judged or recorded.
+  // A request that reached egress through fetch(), by any handler, is not recorded again.
+  let message;
+  await context.route('**/api/items', (route) => route.fulfill({ body: 'context mock' }));
+  await page.route('**/api/items', async (route) => {
+    message = await route.fetch({ method: 'PATCH' }).then(() => 'fetched', (e) => e.message);
+    return route.fallback();
+  });
+  expect(await send(page, 'POST')).toBe('context mock');
+  expect(message).toBe(`write-guard: route.fetch of PATCH ${APP}/api/items is refused under read-only`);
+
+  // Nothing left the browser; only the fetch reached an egress.
   expect(server.writes()).toEqual([]);
-  expect(guard.record()).toMatchObject({ blocked: 0, observed: 0, routed_requests: routed, events: [] });
+  expect(guard.record()).toMatchObject({ blocked: 1, observed: 0, mocked: 3, suspect: 0, routed_requests: routed + 1 });
+  expect(guard.record().events).toEqual([
+    write('mocked', 'POST', { contentType: TEXT_TYPE, body: '{}' }),
+    write('mocked', 'DELETE', { contentType: TEXT_TYPE, body: '{}' }),
+    write('mocked', 'PUT', { body: 'changed' }),
+    write('block', 'PATCH', { contentType: TEXT_TYPE, body: '{}' }),
+  ]);
+
+  // Under observe a mocked write is recorded the same way.
+  const other = await browser.newContext();
+  try {
+    await serve(other);
+    const watcher = await install(other, { policy: 'observe', log: null });
+    const seen = await open(other);
+    await seen.route('**/api/items', (route) => route.fulfill({ body: 'mocked' }));
+    expect(await send(seen, 'DELETE')).toBe('mocked');
+    expect(watcher.record()).toMatchObject({ observed: 0, mocked: 1, events: [write('mocked', 'DELETE')] });
+  } finally {
+    await other.close();
+  }
 });
 
 test('a continued or fetched write is judged at egress', async ({ context }) => {
@@ -1034,50 +1325,28 @@ test('a header signature allows a read', async ({ context }) => {
 
 test('a websocket open is recorded', async ({ context }) => {
   // A page on https://app.test cannot open ws://127.0.0.1, so the page comes from the
-  // socket server's own origin. It answers one short text frame with its echo.
-  const sockets = [];
-  const server = createServer((req, res) => res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><p>Socket</p>'));
-  server.on('upgrade', (req, socket) => {
-    sockets.push(socket);
-    socket.on('error', () => {});
-    const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    socket.on('data', (d) => {
-      if ((d[0] & 0x0f) !== 1) return;
-      const length = d[1] & 0x7f;
-      const mask = d.subarray(2, 6);
-      const payload = Buffer.from(d.subarray(6, 6 + length).map((byte, i) => byte ^ mask[i % 4]));
-      socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]));
-    });
+  // socket server's own origin.
+  const { host } = await listenEcho();
+  const guard = await install(context, { log: null });
+  const page = await context.newPage();
+  await page.goto(`http://${host}/`);
+  const routed = guard.record().routed_requests;
+
+  const echo = await page.evaluate((u) => new Promise((resolve, reject) => {
+    const ws = new WebSocket(u);
+    ws.addEventListener('open', () => ws.send('hello'));
+    ws.addEventListener('message', (e) => { resolve(e.data); ws.close(); });
+    ws.addEventListener('error', () => reject(new Error('socket error')));
+  }), `ws://${host}/socket`);
+
+  expect(echo).toBe('hello');
+  expect(guard.record()).toMatchObject({
+    blocked: 0,
+    observed: 0,
+    routed_requests: routed,
+    events: [{ kind: 'websocket', action: 'open', url: `ws://${host}/socket`, at: expect.any(String) }],
   });
-  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
-  try {
-    const host = `127.0.0.1:${server.address().port}`;
-    const guard = await install(context, { log: null });
-    const page = await context.newPage();
-    await page.goto(`http://${host}/`);
-    const routed = guard.record().routed_requests;
-
-    const echo = await page.evaluate((u) => new Promise((resolve, reject) => {
-      const ws = new WebSocket(u);
-      ws.addEventListener('open', () => ws.send('hello'));
-      ws.addEventListener('message', (e) => { resolve(e.data); ws.close(); });
-      ws.addEventListener('error', () => reject(new Error('socket error')));
-    }), `ws://${host}/socket`);
-
-    expect(echo).toBe('hello');
-    expect(guard.record()).toMatchObject({
-      blocked: 0,
-      observed: 0,
-      routed_requests: routed,
-      events: [{ kind: 'websocket', action: 'open', url: `ws://${host}/socket`, at: expect.any(String) }],
-    });
-    expect(Object.keys(guard.record().events[0]).sort()).toEqual(['action', 'at', 'kind', 'url']);
-  } finally {
-    for (const s of sockets) s.destroy();
-    server.closeAllConnections();
-    await new Promise((done) => server.close(done));
-  }
+  expect(Object.keys(guard.record().events[0]).sort()).toEqual(['action', 'at', 'kind', 'url']);
 });
 
 test('an overridden body is judged at continue', async ({ context }) => {
@@ -1091,9 +1360,18 @@ test('an overridden body is judged at continue', async ({ context }) => {
   for (override of [{ postData: 'drop it' }, { postData: Buffer.from('drop it') }, { postData: { op: 'drop' } }]) {
     expect(await send(page, 'GET')).toBe('network error');
   }
+  // route.fetch sends its postData as the body, so it is judged as the body there too.
+  await page.unrouteAll();
+  let message;
+  await page.route('**/api/items', async (route) => {
+    message = await route.fetch({ postData: 'drop it' }).then(() => 'fetched', (e) => e.message);
+    return route.fulfill({ body: 'mocked' });
+  });
+  expect(await send(page, 'GET')).toBe('mocked');
+  expect(message).toBe(`write-guard: route.fetch of GET ${APP}/api/items is refused under read-only`);
 
   expect(server.seen.filter((s) => s.endsWith('/api/items'))).toEqual([]);
-  expect(guard.record().events).toEqual([write('block', 'GET'), write('block', 'GET'), write('block', 'GET')]);
+  expect(guard.record().events).toEqual(Array(4).fill(write('block', 'GET')));
 });
 
 test('an allowed or observed continue keeps its options', async ({ context }) => {
@@ -1227,4 +1505,179 @@ test('the submit fallback takes the first submit button', async ({ context }) =>
   await page.evaluate(() => document.getElementById('fi-form').requestSubmit());
   await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
   expect(await hits(page)).toEqual([]);
+});
+
+test('a route.fetch is judged once', async ({ context }) => {
+  const server = await listen();
+  const guard = await install(context, { policy: 'observe', log: null });
+  const page = await context.newPage();
+  await page.goto(`${server.origin}/`);
+  const routed = guard.record().routed_requests;
+  await page.route('**/api/save', async (route) => route.fulfill({ response: await route.fetch({ method: 'POST', postData: 'x' }) }));
+
+  expect(await page.evaluate(() => fetch('/api/save').then((r) => r.text()))).toBe('ok');
+  expect(server.lines().filter((l) => l.includes('/api/'))).toEqual(['POST /api/save']);
+  // One egress, one event: route.fetch reaches the raw client, never the request-client
+  // wrapper, and the fulfill after it is not a mock.
+  expect(guard.record()).toMatchObject({ observed: 1, mocked: 0, routed_requests: routed + 1 });
+  expect(guard.record().events).toEqual([
+    { kind: 'request', action: 'observe', reason: expect.any(String), method: 'POST', url: `${server.origin}/api/save`, headerNames: expect.any(Array), at: expect.any(String) },
+  ]);
+});
+
+test('a suspect GET is recorded and not blocked', async ({ context }) => {
+  const server = await serve(context);
+  const real = await listen();
+  const guard = await install(context, { log: null, suspectGets: ['/api/ping$'] });
+  const page = await open(context);
+  const get = (path) => page.evaluate((p) => fetch(p).then((r) => r.text(), () => 'network error'), path);
+
+  // Browser egress: suspect GETs go through and are recorded; a POST there is a write.
+  for (const path of ['/api/logout', '/api/items?action=drop', '/api/ping', '/api/catalog']) expect(await get(path)).toBe(SERVED);
+  expect(await post(page, '/api/logout', '{}')).toBe('network error');
+  // Request clients and Node fetch.
+  expect(await outcome(context.request.get(`${real.origin}/api/sign_out`))).toBe('ok');
+  expect(await outcome(context.request.head(`${real.origin}/api/unsubscribe?t=1`))).toBe('');
+  expect(await guard.guardFetch(fetch)(`${real.origin}/api/logout#x`).then((r) => r.text())).toBe('ok');
+  // A GET a caller fulfills is never recorded as suspect.
+  await page.route('**/api/confirm', (route) => route.fulfill({ body: 'mocked' }));
+  expect(await get('/api/confirm')).toBe('mocked');
+
+  expect(server.seen.filter((s) => s.includes('/api/'))).toEqual(['GET /api/logout', 'GET /api/items', 'GET /api/ping', 'GET /api/catalog']);
+  expect(real.lines()).toEqual(['GET /api/sign_out', 'HEAD /api/unsubscribe?t=1', 'GET /api/logout']);
+  const suspect = (method, url, via) => ({ kind: 'request', action: 'suspect', reason: expect.any(String), method, url, ...(via ? { via } : {}), headerNames: expect.any(Array), at: expect.any(String) });
+  expect(guard.record().events).toEqual([
+    suspect('GET', `${APP}/api/logout`),
+    suspect('GET', `${APP}/api/items?action=drop`),
+    suspect('GET', `${APP}/api/ping`),
+    write('block', 'POST', { url: `${APP}/api/logout`, contentType: TEXT_TYPE }),
+    suspect('GET', `${real.origin}/api/sign_out`, 'request-client'),
+    suspect('HEAD', `${real.origin}/api/unsubscribe?t=1`, 'request-client'),
+    suspect('GET', `${real.origin}/api/logout`, 'node-fetch'),
+  ]);
+  expect(guard.record()).toMatchObject({ suspect: 6, blocked: 1, observed: 0, mocked: 0 });
+});
+
+test('request events carry header names', async ({ context }) => {
+  await serve(context);
+  const server = await listen();
+  const url = `${server.origin}/api/mode`;
+  const guard = await install(context, { log: null, allow: [{ method: 'POST', url: '/api/mode$', headers: { 'X-Mode': '^read$' } }] });
+  const page = await open(context);
+
+  // Browser egress: the effective header names, lower case, unique, sorted; never the values.
+  await page.evaluate(() => fetch('/api/items', { method: 'POST', headers: { 'X-B': '1', 'X-A': '2', 'Content-Type': 'text/csv' }, body: 'a' }).catch(() => {}));
+  const [browserEvent] = guard.record().events;
+  expect(browserEvent.headerNames).toEqual(expect.arrayContaining(['content-type', 'x-a', 'x-b']));
+  expect(browserEvent.headerNames).toEqual([...new Set(browserEvent.headerNames.map((n) => n.toLowerCase()))].sort());
+  expect(Object.keys(browserEvent).sort()).toEqual(['action', 'at', 'contentType', 'headerNames', 'kind', 'method', 'reason', 'url']);
+
+  // A request client: names as for...in enumerates them (inherited ones too), undefined values
+  // skipped, and of names equal after lower-casing the last is judged, as Playwright sends it.
+  const headers = Object.assign(Object.create({ 'X-Inherited': '1' }), { 'X-Mode': 'read', 'x-mode': 'write', 'Content-Type': 'text/csv', 'content-type': 'text/plain', 'X-Undefined': undefined });
+  expect(await outcome(context.request.post(url, { data: 'a', headers }))).toBe(refusal('POST', url));
+  expect(await outcome(context.request.post(url, { data: 'a', headers: { 'x-mode': 'write', 'X-Mode': 'read' } }))).toBe('ok');
+  expect(server.seen.map((s) => s.headers['x-mode'])).toEqual(['read']);
+  // Node fetch: through new Headers(), so repeated names are one.
+  await guard.guardFetch(fetch)(url, { method: 'PUT', headers: new Headers([['X-Z', '1'], ['x-z', '2'], ['Content-Type', 'text/csv']]) }).catch(() => {});
+  expect(server.seen).toHaveLength(1);
+  expect(guard.record().events.slice(1)).toEqual([
+    sent('block', 'POST', url, 'request-client', { contentType: 'text/plain', headerNames: ['content-type', 'x-inherited', 'x-mode'] }),
+    sent('block', 'PUT', url, 'node-fetch', { contentType: 'text/csv', headerNames: ['content-type', 'x-z'] }),
+  ]);
+});
+
+test('a matching WebSocket frame is dropped and recorded', async ({ context, browser }) => {
+  // The page comes from the echo server's own origin (a page on https://app.test cannot open ws://127.0.0.1).
+  const echo = await listenEcho();
+  const url = `ws://${echo.host}/socket`;
+  // Sends each frame in order and resolves with the first message the page receives.
+  const talk = (p, frames) => p.evaluate(([u, fs]) => new Promise((resolve, reject) => {
+    const ws = new WebSocket(u);
+    ws.addEventListener('open', () => { for (const f of fs) ws.send(f === 'binary' ? new Uint8Array([1, 2, 3]) : f); });
+    ws.addEventListener('message', (e) => { resolve(e.data); ws.close(); });
+    ws.addEventListener('error', () => reject(new Error('socket error')));
+  }), [url, frames]);
+
+  const guard = await install(context, { log: null, websocketWrites: ['^deleteItem '] });
+  const page = await context.newPage();
+  await page.goto(`http://${echo.host}/`);
+  // The matching frame never reaches the server; a binary frame and any other text frame do.
+  expect(await talk(page, ['deleteItem 1', 'binary', 'hello'])).toBe('hello');
+  expect(echo.frames).toEqual(['binary 3', 'hello']);
+  expect(guard.record()).toMatchObject({ blocked: 1, observed: 0 });
+  expect(guard.record().events).toEqual([
+    { kind: 'websocket', action: 'open', url, at: expect.any(String) },
+    { kind: 'websocket', action: 'block', reason: expect.any(String), url, at: expect.any(String) },
+  ]);
+
+  // Under observe it is recorded, with its text under logBodies, and forwarded; the echo the
+  // server sends back is never judged.
+  const other = await browser.newContext();
+  try {
+    const watcher = await install(other, { policy: 'observe', log: null, logBodies: true, websocketWrites: ['^deleteItem '] });
+    const seen = await other.newPage();
+    await seen.goto(`http://${echo.host}/`);
+    expect(await talk(seen, ['deleteItem 2'])).toBe('deleteItem 2');
+    expect(echo.frames).toEqual(['binary 3', 'hello', 'deleteItem 2']);
+    expect(watcher.record()).toMatchObject({ blocked: 0, observed: 1 });
+    expect(watcher.record().events[1]).toEqual({ kind: 'websocket', action: 'observe', reason: expect.any(String), url, frame: 'deleteItem 2', at: expect.any(String) });
+  } finally {
+    await other.close();
+  }
+});
+
+test('a suspect link is refused and a plain link is not', async ({ context, browser }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/links');
+  const warnings = [];
+  page.on('console', (m) => { if (m.type() === 'warning') warnings.push(m.text()); });
+
+  // Navigating links with a suspect URL are refused whatever their label, and do not navigate.
+  for (const id of ['l-out', 'l-quiet', 'l-go']) await page.click(`#${id}`);
+  expect(await hits(page)).toEqual([]);
+  expect(page.url()).toBe(`${APP}/links`);
+  await expect.poll(() => guard.record().blocked).toBe(3);
+  const link = (label) => ({ kind: 'control', action: 'block', reason: expect.stringContaining('suspect'), label, at: expect.any(String) });
+  expect(guard.record().events).toEqual([link('Log out'), link('Open'), link('Bye')]);
+  await expect.poll(() => warnings).toEqual(guard.record().events.map((e) => `write-guard refused "${e.label}": ${e.reason}`));
+
+  // A plain link is not judged in the page. Links that do not navigate (a hash, javascript:
+  // even with a tab inside the scheme, an empty href) keep the label rule.
+  await page.click('#l-plain');
+  expect(await hits(page)).toEqual(['l-plain']);
+  for (const id of ['l-hash', 'l-js', 'l-tab', 'l-empty']) await page.click(`#${id}`);
+  await expect.poll(() => guard.record().blocked).toBe(7);
+  expect(await hits(page)).toEqual(['l-plain']);
+  expect(guard.record().events.slice(3)).toEqual(Array(4).fill(control('Delete')));
+  expect(server.seen.filter((s) => s.includes('logout'))).toEqual([]);
+
+  // Under observe a suspect link is recorded and goes through.
+  const other = await browser.newContext();
+  try {
+    await serve(other);
+    const watcher = await install(other, { policy: 'observe', log: null });
+    const seen = await visit(other, '/links');
+    await seen.click('#l-quiet');
+    expect(await hits(seen)).toEqual(['l-quiet']);
+    await expect.poll(() => watcher.record().observed).toBe(1);
+    expect(watcher.record().events).toEqual([{ kind: 'control', action: 'observe', reason: expect.stringContaining('suspect'), label: 'Open', at: expect.any(String) }]);
+  } finally {
+    await other.close();
+  }
+});
+
+test('a navigation link is not judged by its text', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null, controls: { icons: ['icon-trash'] } });
+  const page = await visit(context, '/nav');
+
+  // Verbs in the text, or a destructive icon, do not make a navigating link destructive.
+  for (const id of ['v-help', 'v-nav', 'v-icon']) await page.click(`#${id}`);
+  expect(await hits(page)).toEqual(['v-help', 'v-nav', 'v-icon']);
+  // A [role=link] that is not an a[href] keeps the label rule.
+  await page.click('#v-role');
+  await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
+  expect(await hits(page)).toEqual(['v-help', 'v-nav', 'v-icon']);
 });

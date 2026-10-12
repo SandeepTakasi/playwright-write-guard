@@ -155,10 +155,12 @@ test.describe('read-only', () => {
     await expect(page.locator('#saved')).toHaveText('0');
   });
 
-  test('page.request and context.request refuse to send', async ({ page, context }) => {
+  test('page.request and context.request judge each send', async ({ page, context }) => {
     const server = await serve(page, '<p>Items</p>');
-    await expect(page.request.get(`${server.origin}/api/items`)).rejects.toThrow(/^write-guard: /);
-    await expect(context.request.post(`${server.origin}/api/items`)).rejects.toThrow(/^write-guard: /);
+    expect(await (await page.request.get(`${server.origin}/api/items`)).text()).toBe('ok');
+    await expect(context.request.post(`${server.origin}/api/items`)).rejects
+      .toThrow(`write-guard: POST ${server.origin}/api/items through APIRequestContext is refused under read-only`);
+    expect(server.writes()).toEqual([]);
   });
 
   test('service workers are blocked', async ({ page, context }) => {
