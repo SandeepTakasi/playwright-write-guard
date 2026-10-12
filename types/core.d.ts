@@ -49,9 +49,28 @@ export interface Config {
   defaultControls?: boolean;
   /** Default `"allow"`. */
   websockets?: 'allow' | 'block';
+  /**
+   * Default `[]`. Regex sources, compiled with no flags (case-sensitive) and tested
+   * unanchored against each outbound WebSocket text frame under `websockets: "allow"`.
+   * A frame matching any of them is a write. Empty: frames are not judged.
+   */
+  websocketWrites?: string[];
+  /**
+   * Default `[]`. Regex sources, compiled case-insensitive and tested unanchored against a
+   * GET or HEAD request's URL path plus query, added to the built-in suspect pattern.
+   */
+  suspectGets?: string[];
+  /**
+   * Default `true`: include the built-in suspect pattern,
+   * `(?:^|[/._-])(?:(?:log|sign)[-_]?out|unsubscribe|confirm|delete|remove)(?:$|[/._?&#-])|[?&]action=`.
+   */
+  defaultSuspectGets?: boolean;
   /** JSONL audit log path, relative to the working directory. Default `"write-guard.jsonl"`; `null` turns it off. */
   log?: string | null;
-  /** Default `false`: when `true`, request events carry `body`, the first 500 characters of the request body. */
+  /**
+   * Default `false`: when `true`, request events carry `body`, the first 500 characters of the
+   * request body, and WebSocket frame events carry `frame`, the first 500 characters of the frame.
+   */
   logBodies?: boolean;
 }
 
@@ -75,6 +94,14 @@ export interface CompiledConfig {
   /** `controls.icons`; there are no built-in icons. */
   icons: string[];
   websockets: 'allow' | 'block';
+  /** `websocketWrites`, each compiled with no flags. */
+  websocketWrites: RegExp[];
+  /**
+   * The built-in suspect pattern (unless `defaultSuspectGets` is false) and every
+   * `suspectGets` source, each wrapped in `(?:...)` and joined with `|` into one
+   * case-insensitive pattern; `null` when there are none.
+   */
+  suspect: RegExp | null;
   log: string | null;
   logBodies: boolean;
 }
@@ -105,6 +132,23 @@ export interface ControlDecision {
   reason: string;
 }
 
+export interface FrameDecision {
+  action: 'allow' | 'block' | 'observe';
+  reason: string;
+}
+
+export interface SuspectInput {
+  /** Compared in upper case: only `GET` and `HEAD` can be suspect. */
+  method: string;
+  /** An absolute URL is tested by its path plus query; a relative or unparsable one is tested as given. */
+  url: string;
+}
+
+export interface SuspectDecision {
+  suspect: boolean;
+  reason: string;
+}
+
 /**
  * Validate a raw config and apply its defaults. `null` and `undefined` mean `{}`.
  * Throws `write-guard: <path>: <message>` on anything malformed.
@@ -116,3 +160,17 @@ export function decideRequest(request: RequestInput, config: CompiledConfig): Re
 
 /** `block` (read-only) or `observe` (observe) for a destructive control, else `allow`. */
 export function decideControl(control: ControlInput, config: CompiledConfig): ControlDecision;
+
+/**
+ * `block` (read-only) or `observe` (observe) for a string frame matching any
+ * `websocketWrites` pattern, else `allow`. A frame that is not a string is always `allow`.
+ * Runs only in Node.
+ */
+export function decideFrame(text: unknown, config: CompiledConfig): FrameDecision;
+
+/**
+ * `suspect: true` only for a GET or HEAD whose URL matches the compiled `suspect` pattern:
+ * an absolute URL is tested by its `pathname` plus `search`, never its origin or hash; a
+ * relative or unparsable URL is tested as given. Self-contained, as the installer injects it into pages.
+ */
+export function decideSuspect(request: SuspectInput, config: CompiledConfig): SuspectDecision;
