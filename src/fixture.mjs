@@ -1,24 +1,50 @@
 // playwright-write-guard/test: Playwright Test's `test` and `expect`, with every context guarded.
 //
-// The test's own context is guarded with `install` (which also locks context.request and
-// page.request under read-only). Worker-level locks refuse the Playwright APIs that would make
-// a context, a request client or a connection the guard cannot see (newContext, newPage,
-// request.newContext, the global fetch, and the launch and connect family) while a guarded test
-// or hook runs. Nothing else is refused: Node's own http, https and net are not seen.
-// Playwright's own creation of the test's context (and, under observe, of the request
-// fixture) is the one exception, and the window that allows it is shut again straight after.
+// The test's own context is guarded with `install`, which also judges each send through
+// context.request and page.request. The `request` fixture's sends are judged too: by the test's
+// guard in a test and its beforeEach and afterEach hooks, and with the config alone (recorded
+// nowhere) in beforeAll and afterAll. While the test's own function runs, Node's global fetch is
+// judged by the test's guard, and browser.newContext and browser.newPage return guarded contexts.
+// Worker-level locks refuse request.newContext and the launch and connect family while a guarded
+// test or hook runs, and newContext, newPage and fetch outside the test's own function. Node's
+// own http, https and net are not seen. Playwright's own creation of the test's context and of
+// the request fixture is the one exception, and the window that allows it is shut again straight
+// after.
 
 import { test as base, expect } from '@playwright/test';
 import { compileConfig } from './core.mjs';
-import { install, loadConfig } from './install.mjs';
+import { _judgeRequestClient, install, loadConfig } from './install.mjs';
 
 // Open only while Playwright builds this test's context, or its request fixture.
 let contextWindow = false;
 let requestWindow = false;
 
+// The running test's guard, its config, its testInfo and the guards of the contexts it made,
+// set while the `context` fixture is up.
+let current = null;
+
+// True while the test's own function runs: not a hook, not a fixture's setup or teardown.
+// Playwright 1.64 keeps the running step in a private field; anything else refuses.
+const inTestFunction = () => {
+  const r = current?.testInfo._timeoutManager?._running?.runnable;
+  return r?.type === 'test' && !r.fixture;
+};
+
 const refuse = (what) => new Error(
   `write-guard: ${what} is refused: it would make a context, request client or connection the guard cannot see. `
   + 'Drive the app through the test\'s own page and context.');
+
+const serviceWorkersError = (value) => new Error(
+  `write-guard: serviceWorkers is '${value}'; the guard needs 'block', or a service worker can send requests it never sees`);
+
+// A context made in the test's own function, guarded with the test's config before it is returned.
+async function guardedContext(newContext, options = {}) {
+  const { config, made } = current;
+  if (options.serviceWorkers !== undefined && options.serviceWorkers !== 'block') throw serviceWorkersError(options.serviceWorkers);
+  const context = await newContext({ ...options, serviceWorkers: 'block' });
+  made.push(await install(context, { ...config, log: null }));
+  return context;
+}
 
 export const test = base.extend({
   // The guard's config. Evaluated when a test first needs it, so a bad config file is that
@@ -32,19 +58,27 @@ export const test = base.extend({
   // before the launch family is locked.
   _writeGuardWorker: [async ({ browser, playwright }, use) => {
     const restore = [];
-    const lock = (obj, name, label, open = () => false) => {
+    // `pass(original)` returns the function to call instead, or nothing to refuse.
+    const lock = (obj, name, label, pass = () => null) => {
       if (typeof obj?.[name] !== 'function') return;
-      const original = obj[name];
-      restore.push(() => { obj[name] = original; });
+      const original = obj[name].bind(obj);
+      const own = obj[name];
+      restore.push(() => { obj[name] = own; });
       obj[name] = async (...args) => {
-        if (open()) return original.apply(obj, args);
+        const call = pass(original);
+        if (call) return call(...args);
         throw refuse(label);
       };
     };
-    lock(browser, 'newContext', 'browser.newContext()', () => contextWindow);
-    lock(browser, 'newPage', 'browser.newPage()');
-    lock(playwright.request, 'newContext', 'request.newContext()', () => requestWindow);
-    lock(globalThis, 'fetch', 'fetch() (Node\'s own, from the test)');
+    lock(browser, 'newContext', 'browser.newContext()', (original) => {
+      if (contextWindow) return original;
+      return inTestFunction() ? (options) => guardedContext(original, options) : null;
+    });
+    // Playwright 1.64's newPage calls this.newContext, the guarded one above.
+    lock(browser, 'newPage', 'browser.newPage()', (original) => (inTestFunction() ? original : null));
+    lock(playwright.request, 'newContext', 'request.newContext()', (original) => (requestWindow ? original : null));
+    lock(globalThis, 'fetch', 'fetch() (Node\'s own, outside the test function)',
+      (original) => (inTestFunction() ? current.guard.guardFetch(original) : null));
     for (const type of [playwright.chromium, playwright.firefox, playwright.webkit]) {
       for (const method of ['launch', 'launchPersistentContext', 'launchServer', 'connect', 'connectOverCDP']) {
         lock(type, method, `${type.name()}.${method}()`);
@@ -74,31 +108,36 @@ export const test = base.extend({
     contextWindow = false;
     // install cannot change how the context was created; a project that asked for service
     // workers made a context the guard cannot fully see.
-    if (serviceWorkers !== 'block') {
-      throw new Error(`write-guard: serviceWorkers is '${serviceWorkers}'; the guard needs 'block', or a service worker can send requests it never sees`);
-    }
+    if (serviceWorkers !== 'block') throw serviceWorkersError(serviceWorkers);
     const guard = await install(context, { ...writeGuardConfig, log: null });
+    const made = [];
+    current = { guard, config: writeGuardConfig, testInfo, made };
     try {
       await use(context);
     } finally {
-      await testInfo.attach('write-guard.json', { body: JSON.stringify(await guard.close(), null, 2), contentType: 'application/json' });
+      current = null;
+      const attach = async (name, g) => testInfo.attach(name, { body: JSON.stringify(await g.close(), null, 2), contentType: 'application/json' });
+      await attach('write-guard.json', guard);
+      for (const [i, g] of made.entries()) await attach(`write-guard-${i + 2}.json`, g);
     }
   },
 
-  // Playwright builds the request fixture with request.newContext(), so under observe the
-  // window opens for that. Fixtures are set up in parameter order, so this one comes first.
-  // Under read-only this is where the fixture is refused, at setup, before anything is built.
-  _writeGuardRequestWindow: async ({ writeGuardConfig }, use) => {
-    if (compileConfig(writeGuardConfig).policy === 'read-only') {
-      throw new Error('write-guard: the request fixture is refused under read-only');
-    }
+  // Playwright builds the request fixture with request.newContext(), so the window opens for
+  // that. Fixtures are set up in parameter order, so this one comes first.
+  _writeGuardRequestWindow: async ({}, use) => {
     requestWindow = true;
     try { await use(); } finally { requestWindow = false; }
   },
 
-  request: async ({ _writeGuardRequestWindow, request }, use) => {
+  // Not dependent on `context`, which Playwright refuses in beforeAll and afterAll. Each call
+  // is judged by the guard of the moment: the test's while its context is up, else the config alone.
+  request: async ({ _writeGuardRequestWindow, request, writeGuardConfig, baseURL }, use) => {
     requestWindow = false;
-    await use(request);
+    const unrecorded = _judgeRequestClient(request, compileConfig(writeGuardConfig), { baseURL });
+    const client = () => (current ? current.guard.guardRequestClient(request, { baseURL }) : unrecorded);
+    await use(new Proxy(request, {
+      get: (obj, prop) => (typeof obj[prop] === 'function' ? (...args) => client()[prop](...args) : obj[prop]),
+    }));
   },
 });
 

@@ -20,9 +20,9 @@ test.afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((done) => { s.close(done); s.closeAllConnections(); })));
 });
 
-// A real server on a free port of 127.0.0.1, recording every request that reaches it. The page
-// loads from its origin, past anything a route in the browser could answer.
-async function serve(page, body) {
+// A real server on a free port of 127.0.0.1, recording every request that reaches it. The
+// caller closes it with `close()`.
+async function listen(body = '<p>Items</p>') {
   const seen = [];
   const server = createServer((req, res) => {
     const { pathname } = new URL(req.url, 'http://127.0.0.1');
@@ -32,12 +32,25 @@ async function serve(page, body) {
     if (pathname.endsWith('.js')) return res.writeHead(200, { 'content-type': 'text/javascript' }).end('');
     res.writeHead(200, { 'content-type': 'text/html' }).end(`<!doctype html><html><body>${body}</body></html>`);
   });
-  servers.push(server);
   await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
   const origin = `http://127.0.0.1:${server.address().port}`;
-  await page.goto(`${origin}/items`);
-  return { origin, seen, writes: () => seen.filter((s) => !s.startsWith('GET ')) };
+  const close = () => new Promise((done) => { server.close(done); server.closeAllConnections(); });
+  return { server, origin, seen, close, writes: () => seen.filter((s) => !s.startsWith('GET ')) };
 }
+
+// `listen`, closed after the test, with the page loaded from its origin, past anything a route
+// in the browser could answer.
+async function serve(page, body) {
+  const s = await listen(body);
+  servers.push(s.server);
+  await page.goto(`${s.origin}/items`);
+  return s;
+}
+
+// The attachment named `name` of a finished test, parsed.
+const attached = (info, name) => JSON.parse(info.attachments.find((a) => a.name === name).body.toString());
+
+const POST_REFUSED = (url, via) => `write-guard: POST ${url} through ${via} is refused under read-only`;
 
 const COUNTER = `<script>
   window.counts = {};
@@ -54,15 +67,11 @@ const ACT = (code) => `<button id="go">Go</button><span id="state">idle</span>
 // The refusals that hold under both policies: every way to get a context, request client or
 // connection the guard does not sit in front of.
 function refusals() {
-  test('contexts, request clients and connections outside the guard are refused', async ({ page, browser, playwright }) => {
+  test('request clients and connections outside the guard are refused', async ({ page, playwright }) => {
     await serve(page, '<p>Items</p>');
     const refused = /^write-guard: /;
-    await expect(browser.newContext()).rejects.toThrow(refused);
-    await expect(browser.newPage()).rejects.toThrow(refused);
     await expect(playwright.request.newContext()).rejects.toThrow(refused);
     await expect(apiRequest.newContext()).rejects.toThrow(refused);
-    // Port 9 would refuse the connection anyway; the assertion is on the guard's message.
-    await expect(fetch('http://127.0.0.1:9/api/items', { method: 'POST', body: '{}' })).rejects.toThrow(refused);
     for (const type of [chromium, playwright.firefox, playwright.webkit]) {
       await expect(type.launch()).rejects.toThrow(refused);
       await expect(type.launchPersistentContext('')).rejects.toThrow(refused);
@@ -83,6 +92,35 @@ function refusals() {
       expect(made).toBeInstanceOf(Error);
       expect(made.message).toMatch(/^write-guard: /);
     });
+  });
+
+  test.describe('outside the test function', () => {
+    // Each refusal as its message, or what was made instead. Port 9 would refuse the connection
+    // anyway; the assertion is on the guard's message.
+    const tryAll = async (browser) => [
+      await browser.newContext().then(() => 'made a context', (e) => e.message),
+      await browser.newPage().then(() => 'made a page', (e) => e.message),
+      await fetch('http://127.0.0.1:9/api/items').then(() => 'fetched', (e) => e.message),
+    ];
+    const refused = expect.stringMatching(/^write-guard: .* is refused: /);
+    let before;
+    test.beforeEach(async ({ browser }) => { before = await tryAll(browser); });
+    test.afterEach(async ({ browser }) => { expect(await tryAll(browser)).toEqual([refused, refused, refused]); });
+
+    // A test-scoped fixture set up after the test's context, so only the fixture phase tells it apart.
+    const withFixture = test.extend({
+      fromFixture: async ({ context, browser }, use) => { await use(await tryAll(browser)); },
+    });
+
+    withFixture('browser.newContext, browser.newPage and fetch are refused in hooks and fixtures', async ({ fromFixture }) => {
+      expect(before).toEqual([refused, refused, refused]);
+      expect(fromFixture).toEqual([refused, refused, refused]);
+    });
+  });
+
+  test('the request window closes after the request fixture is made', async ({ request, playwright }) => {
+    expect(typeof request.get).toBe('function');
+    await expect(playwright.request.newContext()).rejects.toThrow(/^write-guard: /);
   });
 }
 
@@ -163,6 +201,108 @@ test.describe('read-only', () => {
     expect(server.writes()).toEqual([]);
   });
 
+  test.describe.serial('sends from the test', () => {
+    let earlier;
+
+    test('the request fixture GET works under read-only', async ({ page, request }, testInfo) => {
+      earlier = { ...earlier, request: testInfo };
+      const server = await serve(page, '<p>Items</p>');
+      expect(await (await request.get(`${server.origin}/api/items`)).text()).toBe('ok');
+      await expect(request.post(`${server.origin}/api/items`, { data: '{}' })).rejects
+        .toThrow(POST_REFUSED(`${server.origin}/api/items`, 'APIRequestContext'));
+      expect(server.writes()).toEqual([]);
+    });
+
+    test('Node fetch in a test is judged', async ({ page }, testInfo) => {
+      earlier = { ...earlier, fetch: testInfo };
+      const server = await serve(page, '<p>Items</p>');
+      expect(await (await fetch(`${server.origin}/api/items`)).text()).toBe('ok');
+      await expect(fetch(`${server.origin}/api/items`, { method: 'POST', body: '{}' })).rejects
+        .toThrow(POST_REFUSED(`${server.origin}/api/items`, 'fetch'));
+      expect(server.writes()).toEqual([]);
+    });
+
+    test('a new context in a test is guarded', async ({ page, browser }, testInfo) => {
+      earlier = { ...earlier, context: testInfo };
+      const server = await serve(page, ACT(`fetch('/api/items', { method: 'POST', body: '{}' }).then(() => done('reached'), () => done('failed'));`));
+      await expect(browser.newContext({ serviceWorkers: 'allow' })).rejects.toThrow(/^write-guard: serviceWorkers is 'allow'/);
+      const made = await browser.newContext();
+      // Playwright Test fills only options that are absent, so an explicit undefined would
+      // reach the browser as its default, 'allow', unless the guard forces 'block'.
+      const fromPage = await browser.newPage({ serviceWorkers: undefined });
+      for (const p of [await made.newPage(), fromPage]) {
+        await p.goto(`${server.origin}/items`);
+        await p.click('#go');
+        await expect(p.locator('#state')).toHaveText('failed');
+      }
+      // Forced to 'block': Chromium accepts the registration and never starts the worker.
+      const worker = await fromPage.evaluate(() => navigator.serviceWorker.register('/sw.js').then(
+        () => Promise.race([navigator.serviceWorker.ready.then(() => 'ready'), new Promise((r) => setTimeout(() => r('no worker'), 1000))]),
+        (e) => `registration failed: ${e.name}`));
+      expect(worker).toBe('no worker');
+      await made.close();
+      await fromPage.context().close();
+      expect(server.writes()).toEqual([]);
+    });
+
+    test('those sends were recorded by the test guard', () => {
+      const via = (record) => record.events.map((e) => [e.action, e.method, e.via]);
+      expect(via(attached(earlier.request, 'write-guard.json'))).toEqual([['block', 'POST', 'request-client']]);
+      expect(via(attached(earlier.fetch, 'write-guard.json'))).toEqual([['block', 'POST', 'node-fetch']]);
+      // The test's own context saw no write; each context it made has its own record.
+      const names = earlier.context.attachments.map((a) => [a.name, a.contentType]);
+      expect(names).toEqual([
+        ['write-guard.json', 'application/json'],
+        ['write-guard-2.json', 'application/json'],
+        ['write-guard-3.json', 'application/json'],
+      ]);
+      expect(attached(earlier.context, 'write-guard.json').events).toEqual([]);
+      for (const n of [2, 3]) {
+        expect(attached(earlier.context, `write-guard-${n}.json`)).toMatchObject({ policy: 'read-only', blocked: 1 });
+      }
+    });
+  });
+
+  test.describe('the request fixture in beforeAll and afterAll', () => {
+    // This block's own config, so a send judged with any other guard's config shows.
+    test.use({ writeGuardConfig: { policy: 'read-only', allow: [{ method: 'POST', url: '/api/open$' }] } });
+    // Not `serve`: this server outlives the tests' afterEach.
+    let api;
+    let before;
+    const sends = async (request) => [
+      await (await request.get(`${api.origin}/api/items`)).text(),
+      await request.post(`${api.origin}/api/items`, { data: '{}' }).then(() => 'sent', (e) => e.message),
+      await request.post(`${api.origin}/api/open`, { data: '{}' }).then((r) => r.text(), (e) => e.message),
+    ];
+    const judged = () => ['ok', POST_REFUSED(`${api.origin}/api/items`, 'APIRequestContext'), 'ok'];
+    test.beforeAll(async ({ request }) => {
+      api = await listen();
+      before = await sends(request);
+    });
+    test.afterAll(async ({ request }) => {
+      try {
+        expect(await sends(request)).toEqual(judged());
+        expect(api.writes()).toEqual(['POST /api/open', 'POST /api/open']);
+      } finally {
+        await api.close();
+      }
+    });
+
+    test('a beforeAll request fixture is judged and not recorded', async ({ page }, testInfo) => {
+      expect(before).toEqual(judged());
+      expect(api.writes()).toEqual(['POST /api/open']);
+    });
+  });
+
+  test.describe('with a baseURL', () => {
+    test.use({ baseURL: 'https://app.test' });
+
+    test('a relative request fixture URL is judged after the baseURL fixture', async ({ request }) => {
+      // Refused before it is sent, so nothing reaches the network.
+      await expect(request.post('/api/items')).rejects.toThrow(POST_REFUSED('https://app.test/api/items', 'APIRequestContext'));
+    });
+  });
+
   test('service workers are blocked', async ({ page, context }) => {
     await serve(page, '<p>Items</p>');
     // Chromium accepts the registration of a blocked worker and never starts it. (Where
@@ -216,12 +356,29 @@ test.describe('observe', () => {
     });
   });
 
-  test.describe('the request fixture', () => {
-    test.use({ writeGuardConfig: { policy: 'observe', log: null } });
+  test.describe.serial('the request fixture in each hook and a fixture', () => {
+    // One server for the block, so each hook can reach it.
+    let api;
+    let earlier;
+    test.beforeAll(async () => { api = await listen(); });
+    test.afterAll(async () => { await api.close(); });
 
-    test('the request window closes after setup under observe', async ({ request, playwright }) => {
-      expect(typeof request.get).toBe('function');
-      await expect(playwright.request.newContext()).rejects.toThrow(/^write-guard: /);
+    const posting = test.extend({
+      posted: async ({ request }, use) => { await request.post(`${api.origin}/api/fixture`); await use(); },
+    });
+    test.beforeEach(async ({ request }) => { await request.post(`${api.origin}/api/before`); });
+    test.afterEach(async ({ request }) => { await request.post(`${api.origin}/api/after`); });
+
+    posting('sends in beforeEach, afterEach and a fixture go through', async ({ posted, request }, testInfo) => {
+      earlier = testInfo;
+      await request.post(`${api.origin}/api/test`);
+    });
+
+    test('and the test guard recorded each', () => {
+      expect(api.writes()).toEqual(['POST /api/before', 'POST /api/fixture', 'POST /api/test', 'POST /api/after', 'POST /api/before']);
+      const record = attached(earlier, 'write-guard.json');
+      expect(record.events.map((e) => [e.action, new URL(e.url).pathname, e.via])).toEqual(
+        ['before', 'fixture', 'test', 'after'].map((p) => ['observe', `/api/${p}`, 'request-client']));
     });
   });
 
@@ -276,14 +433,23 @@ test.afterEach(async () => { await Promise.all(homes.splice(0).map((s) => new Pr
       return page.evaluate(() => fetch('/api/items', { method: 'POST', body: '{}' }).then((r) => r.status, () => 'failed'));
     };`;
 
-  test('the request fixture fails the test at setup under read-only', async ({}, testInfo) => {
+  test('after a failing test, a beforeAll request fixture is judged with its own config', async ({}, testInfo) => {
+    // Port 9 would refuse the connection anyway; the assertion is on the guard's message.
     const results = await playwrightRun(testInfo, {
       spec: `
-        test.use({ writeGuardConfig: { policy: 'read-only' } });
-        test('uses request', async ({ request }) => {});`,
+        test.describe('first', () => {
+          test.use({ writeGuardConfig: { policy: 'observe' } });
+          test('fails', async ({ request }) => { expect(1).toBe(2); });
+        });
+        test.describe('then', () => {
+          test.use({ writeGuardConfig: { policy: 'read-only' } });
+          let sent;
+          test.beforeAll(async ({ request }) => { sent = await request.post('http://127.0.0.1:9/api/items').then(() => 'sent', (e) => e.message); });
+          test('judged', () => { expect(sent).toBe('write-guard: POST http://127.0.0.1:9/api/items through APIRequestContext is refused under read-only'); });
+        });`,
     });
-    expect(results['uses request'].status).toBe('failed');
-    expect(results['uses request'].error).toContain('write-guard: the request fixture is refused under read-only');
+    expect(results.fails.status).toBe('failed');
+    expect(results.judged).toMatchObject({ status: 'passed' });
   });
 
   test('WRITE_GUARD_POLICY applies to the default config, not to one given with test.use', async ({}, testInfo) => {
