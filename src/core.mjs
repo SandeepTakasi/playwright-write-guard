@@ -12,6 +12,7 @@
 export function compileConfig(raw) {
   const VERBS = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase',
     'log out', 'sign out', 'logout'];
+  const SUSPECT = '(?:^|[/._-])(?:(?:log|sign)[-_]?out|unsubscribe|confirm|delete|remove)(?:$|[/._?&#-])|[?&]action=';
   const fail = (path, message) => { throw new Error(`write-guard: ${path}: ${message}`); };
   const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   const list = (v, path) => {
@@ -69,6 +70,14 @@ export function compileConfig(raw) {
   const parts = [...(cfg.defaultControls === false ? [] : [`\\b(?:${VERBS.join('|')})\\b`]),
     ...extra.map((s) => `(?:${s})`)];
 
+  if (cfg.defaultSuspectGets !== undefined && typeof cfg.defaultSuspectGets !== 'boolean') {
+    fail('defaultSuspectGets', 'must be a boolean');
+  }
+  const websocketWrites = list(cfg.websocketWrites, 'websocketWrites').map((s, i) => regex(s, `websocketWrites[${i}]`, ''));
+  const suspectGets = list(cfg.suspectGets, 'suspectGets');
+  suspectGets.forEach((s, i) => regex(s, `suspectGets[${i}]`, 'i'));
+  const suspectParts = [...(cfg.defaultSuspectGets === false ? [] : [SUSPECT]), ...suspectGets].map((s) => `(?:${s})`);
+
   return {
     policy,
     allow,
@@ -76,6 +85,8 @@ export function compileConfig(raw) {
     text: parts.length ? new RegExp(parts.join('|'), 'i') : null,
     icons: [...icons],
     websockets,
+    websocketWrites,
+    suspect: suspectParts.length ? new RegExp(suspectParts.join('|'), 'i') : null,
     log: cfg.log === undefined ? 'write-guard.jsonl' : cfg.log,
     logBodies: cfg.logBodies === true,
   };
@@ -102,6 +113,35 @@ export function decideRequest(request, config) {
   return config.policy === 'observe'
     ? { action: 'observe', reason: `${what}; policy observe` }
     : { action: 'block', reason: `${what}; policy read-only` };
+}
+
+/**
+ * `block` (read-only) or `observe` (observe) for a string frame matching any `websocketWrites`
+ * pattern, else `allow`. A frame that is not a string is always `allow`. Runs only in Node.
+ */
+export function decideFrame(text, config) {
+  const hit = typeof text === 'string' ? config.websocketWrites.findIndex((re) => re.test(text)) : -1;
+  if (hit === -1) return { action: 'allow', reason: 'not a frame matching websocketWrites' };
+  const what = `frame matches websocketWrites[${hit}]`;
+  return config.policy === 'observe'
+    ? { action: 'observe', reason: `${what}; policy observe` }
+    : { action: 'block', reason: `${what}; policy read-only` };
+}
+
+/**
+ * `suspect: true` only for a GET or HEAD whose URL matches the compiled `suspect` pattern, tested
+ * by pathname plus search for an absolute URL and as given otherwise. Self-contained (injected into pages).
+ */
+export function decideSuspect(request, config) {
+  const method = String(request.method ?? '').toUpperCase();
+  const url = String(request.url ?? '');
+  if (method !== 'GET' && method !== 'HEAD') return { suspect: false, reason: `${method} is not a GET or HEAD` };
+  if (config.suspect === null) return { suspect: false, reason: 'no suspect pattern is configured' };
+  let tested = url;
+  try { const u = new URL(url); tested = u.pathname + u.search; } catch { /* relative or unparsable: tested as given */ }
+  return config.suspect.test(tested)
+    ? { suspect: true, reason: `${method} ${tested.slice(0, 80)} matches the suspect pattern` }
+    : { suspect: false, reason: `${method} ${tested.slice(0, 80)} matches no suspect pattern` };
 }
 
 /** `block` (read-only) or `observe` (observe) for a destructive control, else `allow`. */

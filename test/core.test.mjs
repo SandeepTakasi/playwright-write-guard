@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compileConfig, decideControl, decideRequest } from '../src/core.mjs';
+import { compileConfig, decideControl, decideFrame, decideRequest, decideSuspect } from '../src/core.mjs';
 
 const cfg = (raw) => compileConfig(raw);
 const req = (method, url, body = null) => ({ method, url, body });
@@ -396,16 +396,198 @@ test('with defaultControls false and no text only icons can match', () => {
   assert.equal(decideControl(ctl('', ['icon-x']), c).action, 'block');
 });
 
+// --- websocketWrites and decideFrame -------------------------------------------------
+
+test('websocketWrites defaults to an empty list and compiles one RegExp per source with no flags', () => {
+  for (const raw of [null, undefined, {}, { websocketWrites: [] }]) assert.deepEqual(cfg(raw).websocketWrites, []);
+  const w = cfg({ websocketWrites: ['"event":"delete_item"', 'drop|wipe'] }).websocketWrites;
+  assert.equal(w.length, 2);
+  for (const re of w) {
+    assert.ok(re instanceof RegExp);
+    assert.equal(re.flags, '');
+  }
+  assert.equal(w[0].source, '"event":"delete_item"');
+});
+
+test('malformed websocketWrites and suspectGets throw with the contract messages', () => {
+  for (const key of ['websocketWrites', 'suspectGets']) {
+    for (const v of ['x', {}, 5, null, true]) {
+      assert.throws(() => cfg({ [key]: v }), { message: `write-guard: ${key}: must be a list` }, `${key} ${String(v)}`);
+    }
+    for (const v of ['', 5, null, undefined, {}, ['x']]) {
+      assert.throws(
+        () => cfg({ [key]: ['ok', v] }),
+        { message: `write-guard: ${key}[1]: must be a non-empty regex string` },
+        `${key} ${String(v)}`,
+      );
+    }
+    assert.throws(() => cfg({ [key]: ['('] }), (e) => e.message.startsWith(`write-guard: ${key}[0]: does not compile: `));
+    assert.throws(() => cfg({ [key]: ['ok', 'ok', '['] }), (e) => e.message.startsWith(`write-guard: ${key}[2]: does not compile: `));
+  }
+  assert.throws(() => cfg({ websocketWrites: [5] }), { message: 'write-guard: websocketWrites[0]: must be a non-empty regex string' });
+});
+
+test('decideFrame blocks a matching string frame under read-only and observes under observe', () => {
+  const raw = { websocketWrites: ['deleteItem', '"op":"save"'] };
+  const ro = cfg(raw);
+  const ob = cfg({ ...raw, policy: 'observe' });
+  assert.equal(decideFrame('deleteItem 1', ro).action, 'block');
+  assert.equal(decideFrame('{"op":"save","id":2}', ro).action, 'block', 'second pattern');
+  assert.equal(decideFrame('xx deleteItem', ro).action, 'block', 'unanchored');
+  assert.equal(decideFrame('deleteItem 1', ob).action, 'observe');
+  assert.equal(decideFrame('listItems', ro).action, 'allow');
+  assert.equal(decideFrame('listItems', ob).action, 'allow');
+  assert.equal(decideFrame('DELETEITEM', ro).action, 'allow', 'case-sensitive');
+  assert.equal(decideFrame('', ro).action, 'allow');
+});
+
+test('decideFrame allows every frame when websocketWrites is empty', () => {
+  assert.equal(decideFrame('deleteItem 1', cfg()).action, 'allow');
+  assert.equal(decideFrame('', cfg({ policy: 'observe' })).action, 'allow');
+});
+
+test('decideFrame allows a frame that is not a string, even when its text would match', () => {
+  const c = cfg({ websocketWrites: ['.'] });
+  const frames = [Buffer.from('deleteItem'), new Uint8Array([100, 101]), 5, null, undefined, { toString: () => 'deleteItem' }, ['deleteItem']];
+  for (const f of frames) assert.equal(decideFrame(f, c).action, 'allow', String(f));
+  assert.equal(decideFrame('x', c).action, 'block');
+});
+
+test('decideFrame carries a non-empty reason', () => {
+  const c = cfg({ websocketWrites: ['a'] });
+  for (const d of [decideFrame('a', c), decideFrame('b', c), decideFrame(Buffer.from('a'), c)]) {
+    assert.equal(typeof d.reason, 'string');
+    assert.ok(d.reason.length > 0);
+  }
+});
+
+// --- suspectGets, defaultSuspectGets and decideSuspect ---------------------------------
+
+const BUILTIN = '(?:^|[/._-])(?:(?:log|sign)[-_]?out|unsubscribe|confirm|delete|remove)(?:$|[/._?&#-])|[?&]action=';
+const sus = (method, url, c = cfg()) => decideSuspect({ method, url }, c).suspect;
+
+test('defaultSuspectGets and suspectGets: defaults, the compiled pattern, and null when empty', () => {
+  const d = cfg().suspect;
+  assert.ok(d instanceof RegExp);
+  assert.equal(d.flags, 'i');
+  assert.equal(d.source, `(?:${BUILTIN})`);
+  assert.equal(cfg({ suspectGets: [] }).suspect.source, d.source);
+  assert.equal(cfg({ defaultSuspectGets: true }).suspect.source, d.source);
+  assert.equal(cfg({ defaultSuspectGets: false }).suspect, null);
+  assert.equal(cfg({ defaultSuspectGets: false, suspectGets: [] }).suspect, null);
+  const j = cfg({ defaultSuspectGets: false, suspectGets: ['x', 'a|b'] }).suspect;
+  assert.equal(j.source, '(?:x)|(?:a|b)');
+  assert.equal(j.flags, 'i');
+  assert.equal(cfg({ suspectGets: ['x', 'y'] }).suspect.source, `(?:${BUILTIN})|(?:x)|(?:y)`);
+});
+
+test('defaultSuspectGets that is not a boolean throws', () => {
+  for (const v of ['yes', 1, null, 0, []]) {
+    assert.throws(() => cfg({ defaultSuspectGets: v }), { message: 'write-guard: defaultSuspectGets: must be a boolean' });
+  }
+});
+
+test('the built-in suspect pattern: hits', () => {
+  for (const url of ['https://a.test/logout', 'https://a.test/users/sign_out', 'https://a.test/sign-out',
+    'https://a.test/unsubscribe?t=1', 'https://a.test/items?action=delete', 'https://a.test/items?x=1&action=save',
+    'https://a.test/api/delete/7', 'https://a.test/confirm', 'https://a.test/x/remove.json', 'https://a.test/signout',
+    'https://a.test/LOGOUT', 'https://a.test/log_out', 'https://a.test/log-out?next=/']) {
+    assert.equal(sus('GET', url), true, url);
+  }
+});
+
+test('the built-in suspect pattern: misses', () => {
+  for (const url of ['https://a.test/catalog', 'https://a.test/deleted-items', 'https://a.test/', 'https://a.test/logs',
+    'https://a.test/confirmation', 'https://a.test/removed', 'https://a.test/items?reaction=1', 'https://a.test/preconfirm']) {
+    assert.equal(sus('GET', url), false, url);
+  }
+});
+
+test('an absolute URL is tested by its path plus query, never its origin or hash', () => {
+  assert.equal(sus('GET', 'https://logout.test/catalog'), false, 'origin');
+  assert.equal(sus('GET', 'https://delete.example.com:8080/catalog'), false, 'origin');
+  assert.equal(sus('GET', 'https://a.test/catalog#logout'), false, 'hash');
+  assert.equal(sus('GET', 'https://a.test/catalog#?action=x'), false, 'hash');
+  assert.equal(sus('GET', 'https://user:delete@a.test/catalog'), false, 'userinfo');
+  assert.equal(sus('GET', 'https://a.test/catalog?next=/logout'), true, 'query');
+  const c = cfg({ defaultSuspectGets: false, suspectGets: ['^/only$'] });
+  assert.equal(sus('GET', 'https://a.test/only', c), true, 'anchored on the path');
+  assert.equal(sus('GET', 'https://a.test/only?x=1', c), false, 'the query is part of the tested string');
+  assert.equal(sus('GET', 'https://a.test/x/only', c), false);
+});
+
+test('a relative or unparsable URL is tested as given', () => {
+  assert.equal(sus('GET', '/logout'), true);
+  assert.equal(sus('GET', 'logout'), true, 'tested as given, so the start of the string counts');
+  assert.equal(sus('GET', 'catalog'), false);
+  assert.equal(sus('GET', '/x/sign-out?t=1'), true);
+  assert.equal(sus('GET', '/catalog'), false);
+  assert.equal(sus('GET', '/deleted-items'), false);
+  assert.equal(sus('GET', '?action=delete'), true);
+  assert.equal(sus('GET', 'http://[bad/logout'), true, 'unparsable absolute');
+  const c = cfg({ defaultSuspectGets: false, suspectGets: ['^/only$'] });
+  assert.equal(sus('GET', '/only', c), true);
+  assert.equal(sus('GET', '/only#frag', c), false, 'a relative URL keeps its hash');
+});
+
+test('only GET and HEAD can be suspect, in any case', () => {
+  for (const m of ['GET', 'HEAD', 'get', 'head', 'Get']) assert.equal(sus(m, 'https://a.test/logout'), true, m);
+  for (const m of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'REPORT', '', 'post']) {
+    assert.equal(sus(m, 'https://a.test/logout'), false, m);
+  }
+});
+
+test('suspectGets are case-insensitive, unanchored and added to the built-in', () => {
+  const c = cfg({ suspectGets: ['/export-all', 'WIPE'] });
+  assert.equal(sus('GET', 'https://a.test/Export-ALL/1', c), true);
+  assert.equal(sus('GET', 'https://a.test/x?q=wipe', c), true);
+  assert.equal(sus('GET', 'https://a.test/logout', c), true, 'built-in stays');
+  assert.equal(sus('GET', 'https://a.test/catalog', c), false);
+});
+
+test('defaultSuspectGets false drops the built-in; with nothing left nothing is suspect', () => {
+  assert.equal(sus('GET', 'https://a.test/logout', cfg({ defaultSuspectGets: false })), false);
+  const c = cfg({ defaultSuspectGets: false, suspectGets: ['/export-all'] });
+  assert.equal(sus('GET', 'https://a.test/logout', c), false);
+  assert.equal(sus('GET', 'https://a.test/export-all', c), true);
+});
+
+test('decideSuspect does not depend on the policy and carries a non-empty reason', () => {
+  for (const policy of ['read-only', 'observe']) {
+    const c = cfg({ policy });
+    for (const [m, u] of [['GET', 'https://a.test/logout'], ['GET', 'https://a.test/catalog'], ['POST', 'https://a.test/logout']]) {
+      const d = decideSuspect({ method: m, url: u }, c);
+      assert.equal(typeof d.suspect, 'boolean');
+      assert.equal(typeof d.reason, 'string');
+      assert.ok(d.reason.length > 0);
+    }
+    assert.equal(sus('GET', 'https://a.test/logout', c), true, policy);
+  }
+});
+
+test('a writes signature still makes a suspect GET a write, and decideRequest ignores suspicion', () => {
+  const c = cfg({ writes: [{ method: 'GET', url: '/logout' }] });
+  assert.equal(decideRequest(req('GET', 'https://a.test/logout'), c).action, 'block');
+  assert.equal(decideRequest(req('GET', 'https://a.test/logout'), cfg()).action, 'allow');
+});
+
 // --- injection: every function works when rebuilt from its own source --------------
 
 test('each function behaves identically when rebuilt from its own source text', () => {
   const rebuild = (fn) => new Function(`return ${fn.toString()}`)();
-  const [compile2, control2, request2] = [compileConfig, decideControl, decideRequest].map(rebuild);
+  const [compile2, control2, request2, suspect2, frame2] = [compileConfig, decideControl, decideRequest, decideSuspect, decideFrame].map(rebuild);
   const HDR = { allow: [{ method: 'report', url: '/h$', headers: { 'X-A': '^1$' } }], logBodies: true };
-  for (const raw of [undefined, { policy: 'observe' }, HDR, { ...GRAPHQL, controls: { icons: ['icon-trash'], text: ['nuke'] } }]) {
+  const WS = { websocketWrites: ['deleteItem'], suspectGets: ['/export-all'], defaultSuspectGets: true };
+  for (const raw of [undefined, { policy: 'observe' }, HDR, WS, { defaultSuspectGets: false },
+    { ...GRAPHQL, controls: { icons: ['icon-trash'], text: ['nuke'] } }]) {
     const c1 = cfg(raw);
     const c2 = compile2(raw);
     assert.deepEqual(c2, c1);
+    for (const s of [{ method: 'GET', url: 'https://a.test/logout' }, { method: 'HEAD', url: '/export-all' },
+      { method: 'POST', url: 'https://a.test/logout' }, { method: 'GET', url: 'https://a.test/catalog#logout' }]) {
+      assert.deepEqual(suspect2(s, c2), decideSuspect(s, c1));
+    }
+    for (const f of ['deleteItem 1', 'listItems', Buffer.from('deleteItem')]) assert.deepEqual(frame2(f, c2), decideFrame(f, c1));
     for (const k of [ctl('Delete'), ctl('Open'), ctl('', ['icon-trash']), ctl('nuke it')]) {
       assert.deepEqual(control2(k, c2), decideControl(k, c1));
     }
