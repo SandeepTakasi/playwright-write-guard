@@ -101,7 +101,7 @@ export interface GuardHandle {
    * `head`) are judged with this guard's config and recorded here with
    * `via: "request-client"`; a blocked send rejects with
    * `write-guard: <METHOD> <URL> through APIRequestContext is refused under read-only`.
-   * Relative URLs resolve against `baseURL` when given. Every other property reads through.
+   * Relative URLs resolve against `baseURL` when given. Every property that is not a send method reads through, with methods bound to the raw client.
    */
   guardRequestClient<T extends APIRequestContext>(client: T, options?: { baseURL?: string }): T;
   /**
