@@ -6,7 +6,8 @@
 // or abort it, which is recorded as a mock. Sends through the context's request client, and
 // through clients and fetch functions wrapped with the handle, are judged before they are
 // made. The page side is an init script built from the decision core's own source, with
-// capture-phase listeners that refuse destructive controls before the app sees them.
+// capture-phase listeners that refuse destructive controls before the app sees them, and, under
+// read-only, judges the writes of a frame being left and refuses SharedWorker.
 // No playwright import: everything goes through the context it is handed.
 
 import { existsSync, promises as fsp, readFileSync } from 'node:fs';
@@ -350,6 +351,7 @@ function pageScript(raw) {
   const compileConfig = ${compileConfig.toString()};
   const decideControl = ${decideControl.toString()};
   const decideSuspect = ${decideSuspect.toString()};
+  const decideRequest = ${decideRequest.toString()};
   const cfg = compileConfig(${JSON.stringify(raw ?? {})});
   const bind = window.${BINDING};
   const preventDefault = Function.prototype.call.bind(Event.prototype.preventDefault);
@@ -422,6 +424,93 @@ function pageScript(raw) {
   window.addEventListener('keydown', (e) => {
     if ((e.key === 'Enter' || e.key === ' ') && isControl(document.activeElement)) judge(document.activeElement, e);
   }, true);
+  if (cfg.policy !== 'read-only') return;
+
+  // Under read-only, a write that a leaving frame sends is judged here, because Playwright 1.64
+  // does not route it; nothing is recorded. A frame that is not leaving is untouched.
+  const Req = window.Request, origFetch = window.fetch, reject = Promise.reject.bind(Promise);
+  const USP = window.URLSearchParams, AB = window.ArrayBuffer, isView = AB.isView, TD = window.TextDecoder;
+  const Err = Error, TE = TypeError;
+  const visibility = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState').get;
+  const KEY = Symbol.for('playwright-write-guard.pagehide');
+  let hidden = false;
+  window.addEventListener('pagehide', () => { hidden = true; }, true);
+  window.addEventListener('pageshow', () => { hidden = false; }, true);
+  Object.defineProperty(window, KEY, { get: () => hidden });
+  // This frame or a same-origin ancestor is hidden or has fired pagehide: when a parent's handler
+  // calls into a child frame, the child has seen neither yet.
+  const leaving = () => {
+    for (let w = window; ; w = w.parent) {
+      try {
+        if (w[KEY] === true || visibility.call(w.document) === 'hidden') return true;
+      } catch (_) {
+        return false;
+      }
+      if (w === w.parent) return false;
+    }
+  };
+  const isRead = (m) => m === 'GET' || m === 'HEAD' || m === 'OPTIONS';
+  const resolveURL = (u) => {
+    try { const x = new URL(u, document.baseURI); x.hash = ''; return x.href; } catch (_) { return String(u); }
+  };
+  // A body the page can read synchronously as a string, else none.
+  const bodyText = (b) => typeof b === 'string' ? b
+    : b instanceof USP ? String(b)
+    : b instanceof AB || isView(b) ? new TD().decode(b)
+    : null;
+  // True when the send may proceed; false, after the warning, when it is refused.
+  const refusal = (m, u) => 'write-guard: ' + m + ' ' + u + ' from a hidden or unloading page is refused under read-only';
+  const allowed = (method, url, body, headers) => {
+    if (decideRequest({ method, url, body, headers }, cfg).action === 'allow') return true;
+    warn(refusal(method, url));
+    return false;
+  };
+
+  window.fetch = function fetch(input, init) {
+    if (!leaving()) return origFetch.apply(this, arguments);
+    let r;
+    try { r = new Req(input, init); } catch (e) { return reject(e); }
+    const method = r.method.toUpperCase();
+    if (isRead(method)) return origFetch(r);
+    const url = resolveURL(r.url);
+    const headers = { __proto__: null };
+    r.headers.forEach((v, k) => { headers[k] = v; });
+    const body = init != null && init.body !== undefined ? bodyText(init.body) : null;
+    return allowed(method, url, body, headers) ? origFetch(r) : reject(new TE(refusal(method, url)));
+  };
+
+  const Nav = Navigator.prototype, origBeacon = Nav.sendBeacon;
+  Nav.sendBeacon = function sendBeacon(url, data) {
+    if (leaving() && !allowed('POST', resolveURL(url), bodyText(data), {})) return false;
+    return origBeacon.apply(this, arguments);
+  };
+
+  const XHR = XMLHttpRequest.prototype, origOpen = XHR.open, origSet = XHR.setRequestHeader, origSend = XHR.send;
+  const opened = new WeakMap(), getOpened = WeakMap.prototype.get.bind(opened), setOpened = WeakMap.prototype.set.bind(opened);
+  XHR.open = function open(method, url) {
+    const out = origOpen.apply(this, arguments);
+    setOpened(this, { method: String(method).toUpperCase(), url: resolveURL(url), headers: { __proto__: null } });
+    return out;
+  };
+  XHR.setRequestHeader = function setRequestHeader(name, value) {
+    const out = origSet.apply(this, arguments);
+    const s = getOpened(this);
+    if (s) {
+      const k = String(name).toLowerCase();
+      s.headers[k] = k in s.headers ? s.headers[k] + ', ' + String(value) : String(value);
+    }
+    return out;
+  };
+  XHR.send = function send(body) {
+    const s = getOpened(this);
+    if (s && !isRead(s.method) && leaving() && !allowed(s.method, s.url, bodyText(body), s.headers)) {
+      throw new TE(refusal(s.method, s.url));
+    }
+    return origSend.apply(this, arguments);
+  };
+
+  // A shared worker's HTTP is not routed, so none starts.
+  window.SharedWorker = function SharedWorker() { throw new Err('write-guard: SharedWorker is refused under read-only'); };
 })();`;
 }
 

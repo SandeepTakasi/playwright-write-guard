@@ -212,8 +212,8 @@ test.afterEach(async () => {
 });
 
 // Records each request as `METHOD path` (with its query), its headers and its body; answers
-// paths holding /api/ with "ok" and anything else with a small page.
-async function listen() {
+// paths holding /api/ with "ok", a path in `pages` with its page, and anything else with a small page.
+async function listen(pages = {}) {
   const seen = [];
   const server = createServer((req, res) => {
     const chunks = [];
@@ -221,7 +221,7 @@ async function listen() {
     req.on('end', () => {
       seen.push({ line: `${req.method} ${req.url}`, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') });
       const api = req.url.includes('/api/');
-      res.writeHead(200, { 'content-type': api ? 'text/plain' : 'text/html' }).end(api ? 'ok' : '<!doctype html><p>Ok</p>');
+      res.writeHead(200, { 'content-type': api ? 'text/plain' : 'text/html' }).end(api ? 'ok' : pages[req.url] ?? '<!doctype html><p>Ok</p>');
     });
   });
   servers.push(server);
@@ -1799,4 +1799,167 @@ test('a Node fetch string body is judged', async ({ context }) => {
   expect(await go('mutation')).toBe(refusal('POST', url, 'fetch'));
   expect(server.seen.map((s) => [s.line, s.body])).toEqual([['POST /api/q', 'query']]);
   expect(guard.record().events).toEqual([sent('block', 'POST', url, 'node-fetch', { body: 'mutation' })]);
+});
+
+// Pages for a 127.0.0.1 server that run `code` while they are being left, on each of `events`,
+// with W the window whose APIs it uses and T naming the sender and the event: the page itself
+// ('top'), an about:blank frame it made ('blank', called from the page's own handler, before
+// that frame has seen any event) and a same-origin frame with a handler of its own ('child').
+// `keep(name, value)` stores a result in sessionStorage, which outlives the page.
+const leavingPages = (code, events = ['pagehide']) => {
+  const script = (senders) => `<script>
+const keep = (k, v) => sessionStorage.setItem(k, String(v));
+const run = (W, T) => { try { ${code} } catch (e) { keep(T + ' threw', e.message); } };
+for (const ev of ${JSON.stringify(events)}) addEventListener(ev, () => { ${senders} });
+</script>`;
+  return {
+    '/editor': `<!doctype html><a id="away" href="/other">Other</a><iframe src="/child"></iframe><script>
+const blank = document.body.appendChild(document.createElement('iframe'));
+</script>${script("run(window, 'top-' + ev); run(blank.contentWindow, 'blank-' + ev);")}`,
+    '/child': `<!doctype html>${script("run(window, 'child-' + ev);")}`,
+  };
+};
+const LEAVES = ['page.goto', 'a link click', 'page.close'];
+// Opens the leaving page in a new page and leaves it `how`, then gives the browser a fixed second
+// to deliver what the page sent, so counts at the server do not depend on a race. Returns what the
+// page kept (nothing after page.close).
+async function leave(context, server, how) {
+  server.seen.length = 0;
+  const page = await context.newPage();
+  await page.goto(`${server.origin}/editor`);
+  if (how === 'page.goto') await page.goto(`${server.origin}/other`);
+  if (how === 'a link click') {
+    await page.click('#away');
+    await page.waitForURL('**/other');
+  }
+  if (how === 'page.close') await page.close();
+  await new Promise((settle) => setTimeout(settle, 1000));
+  return how === 'page.close' ? null : page.evaluate(() => ({ ...sessionStorage }));
+}
+// What reached the server other than reads, sorted.
+const writesAt = (server) => server.lines().filter((l) => !l.startsWith('GET ')).sort();
+const unloadRefusal = (method, url) => `write-guard: ${method} ${url} from a hidden or unloading page is refused under read-only`;
+const SENDERS = ['blank', 'child', 'top'];
+
+test('an allowed write from a leaving page still goes out', async ({ context }) => {
+  const server = await listen(leavingPages(`
+keep(T, W.navigator.sendBeacon('/api/kept-beacon-' + T + '#f', 'keep') + ' ' + W.navigator.sendBeacon('/api/kept-beacon-' + T, 'nope'));
+W.fetch('/api/kept-fetch-' + T + '#f', { method: 'POST', body: 'keep', keepalive: true });
+const x = new W.XMLHttpRequest();
+x.open('put', '/api/kept-xhr-' + T);
+x.setRequestHeader('X-Kind', 'draft');
+x.send('x');
+keep('xhr-' + T, 'sent');
+// A second open forgets the header, so this one is refused.
+const y = new W.XMLHttpRequest();
+y.open('PUT', '/api/kept-xhr-' + T);
+y.setRequestHeader('X-Kind', 'draft');
+y.open('PUT', '/api/kept-xhr-' + T);
+try { y.send('x'); keep('reopened-' + T, 'sent'); } catch (e) { keep('reopened-' + T, e.message); }`));
+  // The resolved URL without its fragment, the body, the content type fetch derives and an XHR
+  // header are what the entries match.
+  await install(context, {
+    log: null,
+    allow: [
+      { method: 'POST', url: '^http://127[.]0[.]0[.]1:[0-9]+/api/kept-beacon-[a-z]+-pagehide$', body: '^keep$' },
+      { method: 'POST', url: '^http://127[.]0[.]0[.]1:[0-9]+/api/kept-fetch-[a-z]+-pagehide$', body: '^keep$', headers: { 'content-type': '^text/plain;charset=UTF-8$' } },
+      { method: 'PUT', url: '/api/kept-xhr-', headers: { 'x-kind': '^draft$' } },
+    ],
+  });
+  for (const how of LEAVES) {
+    const kept = await leave(context, server, how);
+    // A beacon or keepalive fetch allowed this way reaches the server; an XHR may be cancelled with the document.
+    const posts = writesAt(server).filter((l) => l.startsWith('POST '));
+    expect(posts, how).toEqual(SENDERS.flatMap((t) => [`POST /api/kept-beacon-${t}-pagehide`, `POST /api/kept-fetch-${t}-pagehide`]).sort());
+    if (kept) {
+      for (const t of SENDERS) {
+        expect(kept[`${t}-pagehide`], `${how} ${t}`).toBe('true false');
+        expect(kept[`xhr-${t}-pagehide`], `${how} ${t}`).toBe('sent');
+        expect(kept[`reopened-${t}-pagehide`], `${how} ${t}`).toBe(unloadRefusal('PUT', `${server.origin}/api/kept-xhr-${t}-pagehide`));
+      }
+    }
+  }
+});
+
+test('an unload beacon does not reach the server under read-only', async ({ context }) => {
+  const server = await listen(leavingPages(`keep(T, W.navigator.sendBeacon('/api/beacon-' + T, 'x'));`, ['visibilitychange', 'pagehide']));
+  const guard = await install(context, { log: null });
+  for (const how of LEAVES) {
+    const kept = await leave(context, server, how);
+    expect(writesAt(server), how).toEqual([]);
+    if (kept) {
+      for (const t of SENDERS) expect(kept[`${t}-pagehide`], `${how} ${t}`).toBe('false');
+      expect(new Set(Object.values(kept)), how).toEqual(new Set(['false']));
+    }
+  }
+  // A send judged in a leaving page is recorded nowhere.
+  expect(guard.record().events).toEqual([]);
+});
+
+test('a keepalive fetch on pagehide does not reach the server under read-only', async ({ context }) => {
+  const server = await listen(leavingPages(`
+W.fetch('/api/keep-' + T, { method: 'POST', body: 'x', keepalive: true }).then(() => keep(T, 'sent'), (e) => keep(T, e.name + ': ' + e.message));
+const x = new W.XMLHttpRequest();
+x.open('POST', '/api/xhr-' + T);
+try { x.send('x'); keep('xhr-' + T, 'sent'); } catch (e) { keep('xhr-' + T, e.name + ': ' + e.message); }`));
+  await install(context, { log: null });
+  for (const how of LEAVES) {
+    const kept = await leave(context, server, how);
+    expect(writesAt(server), how).toEqual([]);
+    if (kept) {
+      for (const t of SENDERS) {
+        const T = `${t}-pagehide`;
+        expect(kept[T], how).toBe(`TypeError: ${unloadRefusal('POST', `${server.origin}/api/keep-${T}`)}`);
+        expect(kept[`xhr-${T}`], how).toBe(`TypeError: ${unloadRefusal('POST', `${server.origin}/api/xhr-${T}`)}`);
+      }
+    }
+  }
+});
+
+test('a beacon sent while the page stays open is judged', async ({ context }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null, allow: [{ method: 'POST', url: '/api/allowed$' }] });
+  const page = await context.newPage();
+  await page.goto(`${server.origin}/`);
+
+  // Untouched: the browser queues both, and each is judged at egress like any other request.
+  expect(await page.evaluate(() => [navigator.sendBeacon('/api/refused', 'x'), navigator.sendBeacon('/api/allowed', 'x')])).toEqual([true, true]);
+  await expect.poll(() => guard.record().events).toEqual([{
+    kind: 'request', action: 'block', reason: expect.any(String), method: 'POST', url: `${server.origin}/api/refused`,
+    contentType: TEXT_TYPE, headerNames: expect.any(Array), at: expect.any(String),
+  }]);
+  await expect.poll(() => writesAt(server)).toEqual(['POST /api/allowed']);
+});
+
+test('a SharedWorker is refused under read-only', async ({ context }) => {
+  const server = await listen();
+  await install(context, { log: null });
+  const page = await context.newPage();
+  await page.goto(`${server.origin}/`);
+
+  // With new or without, in the page and in a frame it makes.
+  const tries = await page.evaluate(() => {
+    const blank = document.body.appendChild(document.createElement('iframe'));
+    return [window, blank.contentWindow].flatMap((W) => [() => new W.SharedWorker('/api/worker.js'), () => W.SharedWorker('/api/worker.js')]
+      .map((start) => { try { start(); return 'started'; } catch (e) { return `${e.constructor.name}: ${e.message}`; } }));
+  });
+  expect(tries).toEqual(Array(4).fill('Error: write-guard: SharedWorker is refused under read-only'));
+});
+
+test('observe leaves sendBeacon, keepalive and SharedWorker alone', async ({ context }) => {
+  const server = await listen(leavingPages(`
+W.navigator.sendBeacon('/api/beacon-' + T, 'x');
+W.fetch('/api/keep-' + T, { method: 'POST', body: 'x', keepalive: true });`));
+  await install(context, { log: null, policy: 'observe' });
+  const page = await context.newPage();
+  await page.goto(`${server.origin}/`);
+
+  const natives = await page.evaluate(() => [window.fetch, Navigator.prototype.sendBeacon, XMLHttpRequest.prototype.open,
+    XMLHttpRequest.prototype.setRequestHeader, XMLHttpRequest.prototype.send, window.SharedWorker]
+    .map((f) => Function.prototype.toString.call(f).endsWith('{ [native code] }')));
+  expect(natives).toEqual(Array(6).fill(true));
+  expect(await page.evaluate(() => typeof new SharedWorker('data:text/javascript,'))).toBe('object');
+  // Sends from a leaving page are neither judged nor refused.
+  await leave(context, server, 'page.goto');
+  expect(writesAt(server)).toEqual(SENDERS.flatMap((t) => [`POST /api/beacon-${t}-pagehide`, `POST /api/keep-${t}-pagehide`]).sort());
 });
