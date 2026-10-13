@@ -1931,28 +1931,107 @@ test('a beacon sent while the page stays open is judged', async ({ context }) =>
   await expect.poll(() => writesAt(server)).toEqual(['POST /api/allowed']);
 });
 
+test('fetchLater is removed under read-only', async ({ browser, context }) => {
+  const server = await listen();
+  // Without the guard the browser has fetchLater, and a POST through it reaches the server
+  // unrouted, so the check below means something.
+  const bare = await browser.newContext();
+  try {
+    const page = await bare.newPage();
+    await page.goto(`${server.origin}/`);
+    expect(await page.evaluate(() => {
+      fetchLater('/api/later', { method: 'POST', body: 'x', activateAfter: 0 });
+      return 'fetchLater' in window;
+    })).toBe(true);
+    await expect.poll(() => writesAt(server)).toEqual(['POST /api/later']);
+  } finally {
+    await bare.close();
+  }
+
+  server.seen.length = 0;
+  await install(context, { log: null });
+  const page = await context.newPage();
+  await page.goto(`${server.origin}/`);
+  // Gone from the page and from a frame it makes, so nothing sends through it.
+  expect(await page.evaluate(() => {
+    const blank = document.body.appendChild(document.createElement('iframe'));
+    return [window, blank.contentWindow].map((W) => {
+      if (typeof W.fetchLater === 'function') W.fetchLater('/api/later', { method: 'POST', body: 'x', activateAfter: 0 });
+      return 'fetchLater' in W;
+    });
+  })).toEqual([false, false]);
+  await page.close();
+  await new Promise((settle) => setTimeout(settle, 1000));
+  expect(writesAt(server)).toEqual([]);
+});
+
+test('a same-origin frame behind a cross-origin frame is judged when it leaves', async ({ playwright }) => {
+  // The top and the inner frame are on 127.0.0.1; the middle frame is on middle.test, which the
+  // browser maps to the same server, so it is cross-origin to both.
+  const pages = {};
+  const server = await listen(pages);
+  const middle = server.origin.replace('127.0.0.1', 'middle.test');
+  pages['/top'] = `<!doctype html><iframe src="${middle}/middle"></iframe><script>
+addEventListener('pagehide', () => {
+  const W = frames[0].frames[0];
+  W.navigator.sendBeacon('/api/inner-beacon', 'x');
+  W.fetch('/api/inner-fetch', { method: 'POST', body: 'x', keepalive: true }).catch(() => {});
+});
+</script>`;
+  pages['/middle'] = `<!doctype html><iframe src="${server.origin}/inner"></iframe>`;
+  const browser = await playwright.chromium.launch({ args: ['--host-resolver-rules=MAP middle.test 127.0.0.1'] });
+  try {
+    const context = await browser.newContext();
+    await install(context, { log: null });
+    for (const how of ['page.goto', 'page.close']) {
+      server.seen.length = 0;
+      const page = await context.newPage();
+      await page.goto(`${server.origin}/top`);
+      // The top reaches the inner frame through the cross-origin middle one.
+      expect(await page.evaluate(() => frames[0].frames[0].location.href), how).toBe(`${server.origin}/inner`);
+      if (how === 'page.goto') await page.goto(`${server.origin}/other`); else await page.close();
+      await new Promise((settle) => setTimeout(settle, 1000));
+      expect(writesAt(server), how).toEqual([]);
+      if (how === 'page.goto') await page.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
 test('a SharedWorker is refused under read-only', async ({ context }) => {
   const server = await listen();
   await install(context, { log: null });
   const page = await context.newPage();
   await page.goto(`${server.origin}/`);
 
-  // With new or without, in the page and in a frame it makes.
-  const tries = await page.evaluate(() => {
+  // Gone from the page and from a frame it makes, so an app that detects it falls back; a
+  // dedicated Worker, which is routed, stays.
+  const present = await page.evaluate(() => {
     const blank = document.body.appendChild(document.createElement('iframe'));
-    return [window, blank.contentWindow].flatMap((W) => [() => new W.SharedWorker('/api/worker.js'), () => W.SharedWorker('/api/worker.js')]
-      .map((start) => { try { start(); return 'started'; } catch (e) { return `${e.constructor.name}: ${e.message}`; } }));
+    return [window, blank.contentWindow].flatMap((W) => ['SharedWorker' in W, typeof W.Worker]);
   });
-  expect(tries).toEqual(Array(4).fill('Error: write-guard: SharedWorker is refused under read-only'));
+  expect(present).toEqual([false, 'function', false, 'function']);
 });
 
-test('observe leaves sendBeacon, keepalive and SharedWorker alone', async ({ context }) => {
+test('observe leaves sendBeacon, keepalive and SharedWorker alone', async ({ browser, context }) => {
   const server = await listen(leavingPages(`
 W.navigator.sendBeacon('/api/beacon-' + T, 'x');
 W.fetch('/api/keep-' + T, { method: 'POST', body: 'x', keepalive: true });`));
+  // fetchLater is expected exactly when the browser has it without the guard.
+  const bare = await browser.newContext();
+  let later;
+  try {
+    const page = await bare.newPage();
+    await page.goto(`${server.origin}/`);
+    later = await page.evaluate(() => typeof window.fetchLater);
+  } finally {
+    await bare.close();
+  }
   await install(context, { log: null, policy: 'observe' });
   const page = await context.newPage();
   await page.goto(`${server.origin}/`);
+  expect(await page.evaluate(() => typeof window.fetchLater)).toBe(later);
 
   const natives = await page.evaluate(() => [window.fetch, Navigator.prototype.sendBeacon, XMLHttpRequest.prototype.open,
     XMLHttpRequest.prototype.setRequestHeader, XMLHttpRequest.prototype.send, window.SharedWorker]

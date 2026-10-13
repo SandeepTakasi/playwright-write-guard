@@ -7,7 +7,7 @@
 // through clients and fetch functions wrapped with the handle, are judged before they are
 // made. The page side is an init script built from the decision core's own source, with
 // capture-phase listeners that refuse destructive controls before the app sees them, and, under
-// read-only, judges the writes of a frame being left and refuses SharedWorker.
+// read-only, judges the writes of a frame being left and removes SharedWorker and fetchLater.
 // No playwright import: everything goes through the context it is handed.
 
 import { existsSync, promises as fsp, readFileSync } from 'node:fs';
@@ -430,22 +430,23 @@ function pageScript(raw) {
   // does not route it; nothing is recorded. A frame that is not leaving is untouched.
   const Req = window.Request, origFetch = window.fetch, reject = Promise.reject.bind(Promise);
   const USP = window.URLSearchParams, AB = window.ArrayBuffer, isView = AB.isView, TD = window.TextDecoder;
-  const Err = Error, TE = TypeError;
+  const TE = TypeError;
   const visibility = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState').get;
   const KEY = Symbol.for('playwright-write-guard.pagehide');
   let hidden = false;
   window.addEventListener('pagehide', () => { hidden = true; }, true);
+  // For a page restored from the back/forward cache. Playwright launches Chromium with
+  // --disable-back-forward-cache, so this branch is not reached under Playwright.
   window.addEventListener('pageshow', () => { hidden = false; }, true);
   Object.defineProperty(window, KEY, { get: () => hidden });
   // This frame or a same-origin ancestor is hidden or has fired pagehide: when a parent's handler
-  // calls into a child frame, the child has seen neither yet.
+  // calls into a child frame, the child has seen neither yet. A cross-origin ancestor cannot be
+  // read, so the walk goes on past it to the same-origin ones above.
   const leaving = () => {
     for (let w = window; ; w = w.parent) {
       try {
         if (w[KEY] === true || visibility.call(w.document) === 'hidden') return true;
-      } catch (_) {
-        return false;
-      }
+      } catch (_) { /* cross-origin */ }
       if (w === w.parent) return false;
     }
   };
@@ -509,8 +510,11 @@ function pageScript(raw) {
     return origSend.apply(this, arguments);
   };
 
-  // A shared worker's HTTP is not routed, so none starts.
-  window.SharedWorker = function SharedWorker() { throw new Err('write-guard: SharedWorker is refused under read-only'); };
+  // Neither a shared worker's HTTP nor a fetchLater request is routed, so both are removed (each is
+  // an own, configurable property of the window); an app that detects them falls back to a
+  // dedicated Worker, fetch or sendBeacon, which are judged.
+  delete window.SharedWorker;
+  delete window.fetchLater;
 })();`;
 }
 
