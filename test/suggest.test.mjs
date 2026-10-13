@@ -59,7 +59,9 @@ test('every regex metacharacter in the origin and path is escaped, and the entry
   const entry = r.allow[0].url;
   assert.ok(entry.startsWith('^http://127\\.0\\.0\\.1:3000/'));
   const re = new RegExp(entry);
-  assert.ok(re.test(url));
+  // A logged URL is already in WHATWG form (Chromium and Node 24 percent-encode ^ in a path), so
+  // test the entry against the parsed href, not the raw string.
+  assert.ok(re.test(u.href));
   assert.ok(re.test(u.origin + u.pathname));
   assert.ok(!re.test(u.origin + u.pathname + 'x'));
   assert.ok(!re.test(u.origin + u.pathname.replace('a.b', 'aXb')));
