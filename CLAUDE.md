@@ -6,7 +6,7 @@ Guide for contributors and coding agents working in this repository.
 
 - `playwright-write-guard` is a zero-dependency ESM package (`"type": "module"`) with no build step. Source lives in `src/`, type declarations in `types/`, and the browser CLI in `bin/`.
 - Do not add a bundler, a transpiler, or a runtime dependency. Prefer the Node standard library and the Playwright APIs already in use.
-- `README.md` lists the limits twice, under `## What it cannot see` and the API's `### What it cannot see`. Change both together, and add a limit there whenever a test or experiment shows the guard does not cover something.
+- The limits are listed twice, under `## What it cannot see` in `README.md` and under `## What it cannot see` in `docs/api.md`. Change both together, and add a limit there whenever a test or experiment shows the guard does not cover something.
 - Source comments must not claim more than the README's limits do (no "cannot bypass", "everything else is refused").
 - Keep changes small and in the files the task owns.
 
