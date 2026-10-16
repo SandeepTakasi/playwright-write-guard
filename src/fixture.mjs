@@ -51,6 +51,9 @@ export const test = base.extend({
   // test's error rather than a failure to load the file. `test.use` replaces it, used as given.
   writeGuardConfig: [async ({}, use) => { await use(loadConfig()); }, { option: true }],
 
+  // Fail the test when its guard, or a context made in it, recorded a block.
+  writeGuardFailOnBlocked: [false, { option: true }],
+
   // A service worker can send requests the guard's route never sees.
   serviceWorkers: 'block',
 
@@ -104,7 +107,7 @@ export const test = base.extend({
 
   // Wraps the built-in context rather than creating one, so storageState, video and trace
   // settings all survive.
-  context: async ({ context, writeGuardConfig, serviceWorkers }, use, testInfo) => {
+  context: async ({ context, writeGuardConfig, writeGuardFailOnBlocked, serviceWorkers }, use, testInfo) => {
     contextWindow = false;
     // install cannot change how the context was created; a project that asked for service
     // workers made a context the guard cannot fully see.
@@ -116,9 +119,22 @@ export const test = base.extend({
       await use(context);
     } finally {
       current = null;
-      const attach = async (name, g) => testInfo.attach(name, { body: JSON.stringify(await g.close(), null, 2), contentType: 'application/json' });
+      const records = [];
+      const attach = async (name, g) => {
+        const record = await g.close();
+        records.push(record);
+        await testInfo.attach(name, { body: JSON.stringify(record, null, 2), contentType: 'application/json' });
+      };
       await attach('write-guard.json', guard);
       for (const [i, g] of made.entries()) await attach(`write-guard-${i + 2}.json`, g);
+      if (writeGuardFailOnBlocked) {
+        const blocked = records.flatMap((r) => r.events).filter((e) => e.action === 'block');
+        // A request event without a method is a refused WebSocket.
+        const item = (e) => (e.kind === 'control' ? `control "${e.label}"` : e.kind === 'request' && e.method ? `request ${e.method} ${e.url}` : `websocket ${e.url}`);
+        if (blocked.length) {
+          throw new Error(`write-guard: ${blocked.length} blocked event(s) and writeGuardFailOnBlocked is set: ${blocked.slice(0, 5).map(item).join('; ')}`);
+        }
+      }
     }
   },
 

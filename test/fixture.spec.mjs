@@ -424,8 +424,14 @@ test.afterEach(async () => { await Promise.all(homes.splice(0).map((s) => new Pr
       ...(suite.specs ?? []).map((s) => [s.title, s.tests[0].results.at(-1)]),
       ...(suite.suites ?? []).flatMap(flat),
     ];
-    return Object.fromEntries(report.suites.flatMap(flat).map(([title, r]) => [title, { status: r.status, error: r.error?.message ?? '' }]));
+    return Object.fromEntries(report.suites.flatMap(flat).map(([title, r]) => [title, { status: r.status, error: r.error?.message ?? '', attachments: r.attachments ?? [] }]));
   }
+
+  // The guard's attachment names (a failing test also gets Playwright's own error-context).
+  const guardAttachments = (result) => result.attachments.map((a) => a.name).filter((n) => n.startsWith('write-guard'));
+
+  // The parsed JSON attachment `name` of a nested test's result, from the JSON report (body is base64).
+  const record = (result, name) => JSON.parse(Buffer.from(result.attachments.find((a) => a.name === name).body, 'base64').toString());
 
   const PROBE = `
     const post = async (page) => {
@@ -530,6 +536,124 @@ test.afterEach(async () => { await Promise.all(homes.splice(0).map((s) => new Pr
     expect(results['recorded the block'].status).toBe('passed');
     // The nested run's working directory is its project directory; a honoured log would be there.
     expect(existsSync(join(testInfo.outputPath('project'), 'write-guard.jsonl'))).toBe(false);
+  });
+
+  // A nested test that makes the guard block one POST from its own page.
+  const BLOCKED_POST = `
+    await page.goto(await home());
+    await page.evaluate(() => fetch('/api/items', { method: 'POST', body: '{}' }).then((r) => r.status, () => 'failed'));`;
+  const ITEMS_POST = /request POST http:\/\/127\.0\.0\.1:[0-9]+\/api\/items/;
+
+  test('writeGuardFailOnBlocked fails a test whose guard blocked a write', async ({}, testInfo) => {
+    const results = await playwrightRun(testInfo, {
+      spec: `
+        test.describe('with the option set', () => {
+          test.use({ writeGuardConfig: { policy: 'read-only' }, writeGuardFailOnBlocked: true });
+          test('one write', async ({ page }) => { ${BLOCKED_POST} });
+          test('seven writes', async ({ page }) => {
+            await page.goto(await home());
+            for (let i = 1; i <= 7; i++) await page.evaluate((n) => fetch('/api/' + n, { method: 'POST' }).catch(() => {}), i);
+          });
+          test('a write and a control', async ({ page }) => {
+            await page.goto(await home());
+            await page.evaluate(() => fetch('/api/items', { method: 'POST' }).catch(() => {}));
+            await page.evaluate(() => { document.body.innerHTML = '<button>Delete item</button>'; });
+            await page.getByRole('button', { name: 'Delete item' }).click();
+          });
+          test.describe('websockets blocked', () => {
+            test.use({ writeGuardConfig: { policy: 'read-only', websockets: 'block' } });
+            test('a refused websocket', async ({ page }) => {
+              await page.goto(await home());
+              await page.evaluate(() => { try { new WebSocket('ws://127.0.0.1:9/socket'); } catch {} });
+              await page.waitForTimeout(200);
+            });
+          });
+          test('a mocked write does not count', async ({ page }) => {
+            await page.goto(await home());
+            await page.route('**/api/items', (route) => route.fulfill({ status: 201, body: 'ok' }));
+            await page.evaluate(() => fetch('/api/items', { method: 'POST' }));
+          });
+          test('a read does not count', async ({ page }) => {
+            await page.goto(await home());
+            await page.evaluate(() => fetch('/api/items'));
+          });
+        });`,
+    });
+    const prefix = (n) => `write-guard: ${n} blocked event(s) and writeGuardFailOnBlocked is set: `;
+    expect(results['one write'].status).toBe('failed');
+    expect(results['one write'].error).toContain(prefix(1) + 'request POST http://127.0.0.1:');
+    expect(results['one write'].error).toMatch(ITEMS_POST);
+    // The option fails the test after the record is attached, not instead of it.
+    expect(guardAttachments(results['one write'])).toEqual(['write-guard.json']);
+    expect(record(results['one write'], 'write-guard.json').blocked).toBe(1);
+    expect(results['seven writes'].status).toBe('failed');
+    const seven = results['seven writes'].error;
+    expect(seven).toContain(prefix(7));
+    for (const n of [1, 2, 3, 4, 5]) expect(seven).toMatch(new RegExp(`/api/${n}(; |$|\\n)`));
+    for (const n of [6, 7]) expect(seven).not.toMatch(new RegExp(`/api/${n}(; |$|\\n)`));
+    expect(results['a write and a control'].status).toBe('failed');
+    expect(results['a write and a control'].error).toMatch(/is set: request POST http:\/\/127\.0\.0\.1:[0-9]+\/api\/items; control "Delete item"/);
+    expect(results['a refused websocket'].status).toBe('failed');
+    expect(results['a refused websocket'].error).toMatch(/is set: websocket ws:\/\/127\.0\.0\.1:9\/socket/);
+    expect(results['a mocked write does not count'].status).toBe('passed');
+    expect(results['a read does not count'].status).toBe('passed');
+  });
+
+  test('a blocked write in a context made in the test also fails it', async ({}, testInfo) => {
+    const results = await playwrightRun(testInfo, {
+      spec: `
+        test.use({ writeGuardConfig: { policy: 'read-only' }, writeGuardFailOnBlocked: true });
+        const refused = (made) => made.request.post('http://127.0.0.1:9/api/items').catch(() => {});
+        test('only the made context blocks', async ({ browser }) => {
+          const made = await browser.newContext();
+          await refused(made);
+          await made.close();
+        });
+        test('both guards block', async ({ page, browser }) => {
+          await page.goto(await home());
+          await page.evaluate(() => fetch('/api/items', { method: 'POST' }).catch(() => {}));
+          const made = await browser.newContext();
+          await refused(made);
+          await made.close();
+        });`,
+    });
+    expect(results['only the made context blocks'].status).toBe('failed');
+    expect(results['only the made context blocks'].error)
+      .toContain('write-guard: 1 blocked event(s) and writeGuardFailOnBlocked is set: request POST http://127.0.0.1:9/api/items');
+    const only = results['only the made context blocks'];
+    expect(guardAttachments(only)).toEqual(['write-guard.json', 'write-guard-2.json']);
+    expect(record(only, 'write-guard-2.json').blocked).toBe(1);
+    expect(results['both guards block'].status).toBe('failed');
+    expect(results['both guards block'].error)
+      .toMatch(/write-guard: 2 blocked event\(s\) and writeGuardFailOnBlocked is set: request POST http:\/\/127\.0\.0\.1:[0-9]+\/api\/items; request POST http:\/\/127\.0\.0\.1:9\/api\/items/);
+  });
+
+  test('writeGuardFailOnBlocked is off by default', async ({}, testInfo) => {
+    const results = await playwrightRun(testInfo, {
+      spec: `
+        test.use({ writeGuardConfig: { policy: 'read-only' } });
+        test('a blocked write passes', async ({ page }) => { ${BLOCKED_POST} });
+        test.describe('set to false', () => {
+          test.use({ writeGuardFailOnBlocked: false });
+          test('a blocked write passes when set to false', async ({ page }) => { ${BLOCKED_POST} });
+        });`,
+    });
+    expect(results).toMatchObject({
+      'a blocked write passes': { status: 'passed' },
+      'a blocked write passes when set to false': { status: 'passed' },
+    });
+    // The write was blocked and recorded, so the pass is the option's default and not a missed block.
+    expect(record(results['a blocked write passes'], 'write-guard.json').blocked).toBe(1);
+  });
+
+  test('observe never fails a test through writeGuardFailOnBlocked', async ({}, testInfo) => {
+    const results = await playwrightRun(testInfo, {
+      spec: `
+        test.use({ writeGuardConfig: { policy: 'observe' }, writeGuardFailOnBlocked: true });
+        test('writes go through', async ({ page }) => { ${BLOCKED_POST} });`,
+    });
+    expect(results['writes go through']).toMatchObject({ status: 'passed', error: '' });
+    expect(record(results['writes go through'], 'write-guard.json')).toMatchObject({ observed: 1, blocked: 0 });
   });
 
   test('a test that allows service workers is refused', async ({}, testInfo) => {
