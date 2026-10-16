@@ -37,9 +37,12 @@ export function compileConfig(raw) {
     }
     const hs = s.headers === undefined || s.headers === null ? {} : s.headers;
     if (!isObj(hs)) fail(`${at}.headers`, 'must be an object');
+    const url = regex(s.url, `${at}.url`, '');
+    // An allow URL that matches '' matches every URL, so it would turn the guard off for its method.
+    if (key === 'allow' && url.test('')) fail(`${at}.url`, 'matches the empty string, so it can match any URL');
     return {
       method: s.method.toUpperCase(),
-      url: regex(s.url, `${at}.url`, ''),
+      url,
       body: s.body === undefined || s.body === null ? null : regex(s.body, `${at}.body`, ''),
       headers: Object.keys(hs).map((k) => ({ name: k.toLowerCase(), value: regex(hs[k], `${at}.headers.${k}`, '') })),
     };
@@ -103,13 +106,15 @@ export function decideRequest(request, config) {
     && (s.body === null || (typeof body === 'string' && s.body.test(body)))
     && s.headers.every((h) => typeof headers[h.name] === 'string' && h.value.test(headers[h.name]));
 
-  const allowed = config.allow.findIndex(matches);
-  if (allowed !== -1) return { action: 'allow', reason: `allow[${allowed}] marks it a read` };
   const hit = config.writes.findIndex(matches);
   let what;
   if (hit !== -1) what = `${method} matches writes[${hit}]`;
-  else if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) what = `${method} is not a read method`;
-  else return { action: 'allow', reason: `${method} is a read method and matches no writes signature` };
+  else {
+    const allowed = config.allow.findIndex(matches);
+    if (allowed !== -1) return { action: 'allow', reason: `allow[${allowed}] marks it a read` };
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) what = `${method} is not a read method`;
+    else return { action: 'allow', reason: `${method} is a read method and matches no writes signature` };
+  }
   return config.policy === 'observe'
     ? { action: 'observe', reason: `${what}; policy observe` }
     : { action: 'block', reason: `${what}; policy read-only` };

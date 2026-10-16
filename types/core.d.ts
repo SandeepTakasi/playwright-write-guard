@@ -32,9 +32,16 @@ export interface Sig {
 export interface Config {
   /** Default `"read-only"`. */
   policy?: Policy;
-  /** Requests matching any of these are never writes. */
+  /**
+   * Requests matching any of these are reads, unless a `writes` signature also matches them
+   * (`writes` always wins). A signature whose `url` matches the empty string (`.*`, `^`, `x?`)
+   * would match every URL, so `compileConfig` throws for it.
+   */
   allow?: Sig[];
-  /** Requests matching any of these are writes even when their method is GET, HEAD or OPTIONS. */
+  /**
+   * Requests matching any of these are writes even when their method is GET, HEAD or OPTIONS,
+   * and even when an `allow` signature also matches them.
+   */
   writes?: Sig[];
   controls?: {
     /** Regex sources, compiled case-insensitive, added to the built-in verbs. */
@@ -155,7 +162,11 @@ export interface SuspectDecision {
  */
 export function compileConfig(raw?: Config | null): CompiledConfig;
 
-/** `block` (read-only) or `observe` (observe) for a write, else `allow`. */
+/**
+ * `block` (read-only) or `observe` (observe) for a write, else `allow`. A `writes` match is a
+ * write first; else an `allow` match is a read; else a method other than GET, HEAD or OPTIONS
+ * is a write.
+ */
 export function decideRequest(request: RequestInput, config: CompiledConfig): RequestDecision;
 
 /** `block` (read-only) or `observe` (observe) for a destructive control, else `allow`. */

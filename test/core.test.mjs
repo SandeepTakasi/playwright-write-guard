@@ -298,14 +298,53 @@ test('an OPTIONS signature compiles and matches an OPTIONS request', () => {
   assert.equal(decideRequest(req('OPTIONS', 'https://a.test/x'), c).action, 'allow');
 });
 
-test('allow always wins over the method default and over writes', () => {
+test('writes always wins over allow', () => {
   const c = cfg({
     allow: [{ method: 'POST', url: '^https://a[.]test/graphql' }],
-    writes: [{ method: 'POST', url: '/graphql' }],
+    writes: [{ method: 'POST', url: '/graphql$', body: 'mutation' }],
   });
-  assert.equal(decideRequest(req('POST', 'https://a.test/graphql'), c).action, 'allow');
-  assert.equal(decideRequest(req('POST', 'https://a.test/other'), c).action, 'block');
-  assert.equal(decideRequest(req('POST', 'https://b.test/graphql'), c).action, 'block');
+  const r = (url, body) => decideRequest(req('POST', url, body), c);
+  // A writes match beats an allow match, and names the first writes signature.
+  assert.deepEqual(r('https://a.test/graphql', 'mutation x'),
+    { action: 'block', reason: 'POST matches writes[0]; policy read-only' });
+  // An allow match still allows a request no writes signature matches.
+  assert.deepEqual(r('https://a.test/graphql', 'query x'),
+    { action: 'allow', reason: 'allow[0] marks it a read' });
+  // The method default is untouched: no match at all is a write for a non-read method.
+  assert.deepEqual(r('https://a.test/other'),
+    { action: 'block', reason: 'POST is not a read method; policy read-only' });
+  assert.deepEqual(r('https://b.test/graphql', 'query x'),
+    { action: 'block', reason: 'POST is not a read method; policy read-only' });
+  assert.deepEqual(decideRequest(req('GET', 'https://a.test/x'), c),
+    { action: 'allow', reason: 'GET is a read method and matches no writes signature' });
+  // Under observe the writes match is observed, not allowed.
+  const o = cfg({ policy: 'observe', allow: [{ method: '*', url: '^https://a[.]test/' }], writes: [{ method: 'POST', url: '/x$' }] });
+  assert.deepEqual(decideRequest(req('POST', 'https://a.test/x'), o),
+    { action: 'observe', reason: 'POST matches writes[0]; policy observe' });
+});
+
+test('an allow URL that matches the empty string is refused', () => {
+  for (const url of ['.*', '^', 'x?', '(?:)', 'a|']) {
+    assert.throws(
+      () => cfg({ allow: [{ method: 'POST', url: '^/ok' }, { method: '*', url }] }),
+      { message: 'write-guard: allow[1].url: matches the empty string, so it can match any URL' },
+      url,
+    );
+    assert.throws(
+      () => cfg({ allow: [{ method: '*', url }] }),
+      { message: 'write-guard: allow[0].url: matches the empty string, so it can match any URL' },
+      url,
+    );
+  }
+  // An anchored or non-empty URL still compiles.
+  assert.equal(cfg({ allow: [{ method: 'GET', url: '^https://a[.]test/' }, { method: 'GET', url: 'x' }] }).allow.length, 2);
+});
+
+test('a writes URL that matches the empty string still compiles', () => {
+  for (const url of ['.*', '^', 'x?', '(?:)', 'a|']) {
+    assert.equal(cfg({ writes: [{ method: 'GET', url }] }).writes.length, 1, url);
+  }
+  assert.equal(decideRequest(req('GET', 'https://a.test/x'), cfg({ writes: [{ method: 'GET', url: '.*' }] })).action, 'block');
 });
 
 test('a body signature separates a query from a mutation on one URL', () => {
