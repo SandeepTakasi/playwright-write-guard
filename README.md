@@ -8,7 +8,7 @@ Pointing an automated browser at a real app is risky when the run should only lo
 
 This package puts a read-only guard in front of the browser:
 
-- **Requests.** Any request whose method is not GET, HEAD or OPTIONS is blocked, unless a signature in your `allow` list says it is really a read (a read-only GraphQL endpoint, for example). Requests that are really writes but look like reads can be named in `writes`. The same rules judge the sends of `context.request` and `page.request`, and, in the Playwright Test fixture, the `request` fixture and Node's `fetch` inside a test: a GET goes through and a write is refused.
+- **Requests.** Any request whose method is not GET, HEAD or OPTIONS is blocked, unless a signature in your `allow` list says it is really a read (a read-only GraphQL endpoint, for example). Requests that are really writes but look like reads can be named in `writes`, and `writes` always wins: a request that matches both an `allow` and a `writes` signature is a write. The same rules judge the sends of `context.request` and `page.request`, and, in the Playwright Test fixture, the `request` fixture and Node's `fetch` inside a test: a GET goes through and a write is refused.
 - **Clicks.** A click, form submit, or Enter or Space keypress on a control whose label is a destructive verb (Save, Delete, Publish, Send, Archive, Pay, Purchase, Log out and so on) is stopped inside the page before the app's own handlers run, and the page's console gets a `write-guard refused "<label>": <reason>` warning, so an agent that reads the console learns why nothing happened. A link that navigates is judged by its URL, not its text (see [Suspect GETs](#websocket-frames-and-suspect-gets)). Native confirmation dialogs are declined.
 - **Log.** Every write it blocked, or only observed under the `observe` policy, is recorded as one JSON line, and so is every write one of your own routes mocked and every side-effecting GET it noticed (`suspect`).
 
@@ -55,7 +55,7 @@ Tests that only read through the page keep working. Under both policies, these c
 - `browser.newContext()` and `browser.newPage()` inside a test return a guarded context, created with `serviceWorkers: 'block'`, so tests with several users can create more contexts. Each one's record is attached as `write-guard-<n>.json`. In hooks and in fixture setup and teardown they still throw (a multi-user fixture that calls `browser.newContext()` fails at setup). `playwright.request.newContext()` and the browser types' `launch` and `connect` family still throw everywhere, because they make clients the guard cannot see.
 - A test can mock a write: a `page.route` handler that `fulfill`s or `abort`s a POST runs, and the request never leaves the browser. The guard records it as a `mocked` event, which counts in `mocked`, not in `blocked`. A handler that passes the request on with `continue()` or `route.fetch()` is judged at that point, overrides included, so the write is still blocked. A mock is not the server: count writes on a real local server, not through a route that fulfills them.
 - Blocked requests other than page navigations are aborted, which the page's console reports as `net::ERR_BLOCKED_BY_CLIENT` errors, so a test that asserts a clean console needs to filter those out.
-- Blocked writes do not fail a test. Check the `blocked` count in the `write-guard.json` attachment if you want them to. A write that one of your own routes fulfills or aborts is counted in `mocked`, not in `blocked`, so check `mocked` as well when the test must prove no write was attempted.
+- Blocked writes do not fail a test by default. Set `writeGuardFailOnBlocked: true` (see below) to fail a test whose guard blocked something, or check the `blocked` count in the `write-guard.json` attachment. A write that one of your own routes fulfills or aborts is counted in `mocked`, not in `blocked`, so check `mocked` as well when the test must prove no write was attempted.
 
 **Dialogs.** Under `read-only` the guard declines every dialog (`alert`, `confirm`, `prompt`, `beforeunload`) first, so a suite's own `accept` on the same dialog throws `Cannot accept dialog which is already handled!`, and its own `dismiss` throws `Cannot dismiss dialog which is already handled!`. The dialog is declined either way; catch the error so the test goes on:
 
@@ -83,6 +83,17 @@ The fixture guards each test's context, created with `serviceWorkers: 'block'`. 
 
 Without the `body` pattern, that signature would allow every request to the URL, mutations included. The pattern is anchored with `^\{`, so it matches only a single operation whose body starts with its name: a batched request (a JSON array) never matches, and neither does a body that puts `operationName` later. Check that your client sends `operationName` first, or the reads stay blocked (the safe direction). The pattern trusts your app's operation names, so list only names that read, and never leave a pattern unanchored.
 
+An `allow` URL that matches the empty string (`.*`, `^`, `x?`) can match any URL, so the config is refused with `write-guard: allow[0].url: matches the empty string, so it can match any URL`. An `allow` URL that is not anchored with `^` still works, but `install` prints `write-guard: warning: allow[0].url: not anchored with ^, so it also matches any URL that merely contains a match` once per process, from Node and never in a page.
+
+A `writes` signature always wins over `allow`. To let a GraphQL endpoint's reads through and still block its mutations, allow the URL and name the mutations in `writes` by a body pattern:
+
+```json
+{
+  "allow": [{ "method": "POST", "url": "^https://app[.]example[.]test/graphql$" }],
+  "writes": [{ "method": "POST", "url": "^https://app[.]example[.]test/graphql$", "body": "mutation" }]
+}
+```
+
 Reads that differ from writes only in a header, such as Next.js server actions, can be allow-listed with a `headers` entry that names the exact action IDs that read, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/items$", "headers": { "next-action": "^(7f3a9c21|1b2e44d0)$" } }`. Every server action sends a `next-action` header, writes included, so a pattern that matches any ID allows every action; and action IDs can change between builds, so re-check them after a deploy. Header names compare case-insensitively and each value is a regex tested against that header on the request.
 
 To set the config in the test file instead, use `test.use`:
@@ -91,7 +102,9 @@ To set the config in the test file instead, use `test.use`:
 test.use({ writeGuardConfig: { policy: 'read-only', allow: [] } });
 ```
 
-Each test attaches what the guard saw as `write-guard.json` (open it from the HTML report or the test's attachments). The fixture never writes a JSONL log file; use that attachment instead.
+To fail a test whose guard blocked something, set the option `writeGuardFailOnBlocked` (off by default) with `test.use({ writeGuardFailOnBlocked: true })`, or in the config's `use`.
+
+Each test attaches what the guard saw as `write-guard.json` (open it from the HTML report or the test's attachments). Its `config_file` names the config file that was loaded, or is `null` when none was read. The fixture never writes a JSONL log file; use that attachment instead.
 
 If you run Playwright with `-c` from another directory, the fixture will not find `write-guard.config.json` and silently falls back to the defaults. Set `WRITE_GUARD_CONFIG` to the config file's path:
 
@@ -147,7 +160,7 @@ The launcher starts Chromium, guards its one context, and prints a WebSocket end
 npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]
 ```
 
-It prints `endpoint: <ws endpoint>`. Attach the agent to it:
+It prints `config: <path>` (or `config: none, using the defaults`) as its first line, then `endpoint: <ws endpoint>`. Attach the agent to it:
 
 - Playwright MCP: start it with `--endpoint <ws endpoint>` and without `--isolated`. `--isolated` makes a new, unguarded context.
 - Playwright CLI: `playwright-cli attach --endpoint=<ws endpoint>`.
@@ -257,6 +270,7 @@ The guard judges requests the browser sends through its context and clicks the p
 - In launcher mode, mocking a blocked write from a client's `context.route`: that handler runs after the guard's catch-all, so it never receives a blocked write. A client's `page.route` can mock one.
 - Mocks outside the guard's process: a write that one of your own routes fulfills or aborts in the guard's process is recorded as `mocked`, but in launcher mode a client's routes run in the client's process, so their mocks are not recorded. A `fulfill` or `abort` of a request that already went through `route.fetch()` records nothing (the fetch was judged), and a GET that a route fulfills or aborts is never recorded as `suspect`. A mock is not counted in `blocked` or `observed`, so a broad stub such as `page.route('**/api/**', ...)` keeps its writes out of those counts; look at `mocked`.
 - A `request` fixture send in a `beforeAll` or `afterAll` hook: it is judged but not recorded, because no test guard exists there, so a run's record and log do not list it.
+- `writeGuardFailOnBlocked` counts only recorded blocks: it does not fail a test for a `request` fixture send refused in a `beforeAll` or `afterAll` hook, or for a leaving page's refusals, because neither is recorded. `mocked`, `suspect` and `observe` events never count either.
 - The launcher's browser and context options: it takes no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials.
 - The HTTP cache: Playwright turns it off while a route is installed, so every load fetches every asset again.
 - Service workers: they are blocked, so `register()` resolves but `navigator.serviceWorker.ready` never settles, and an app that waits for it hangs.
@@ -324,8 +338,8 @@ Every key is optional, and unknown keys are ignored:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `policy` | `"read-only"` or `"observe"` | `"read-only"` | `read-only` blocks writes and destructive controls; `observe` records them and lets them through |
-| `allow` | list of Sig | `[]` | requests that are never writes |
-| `writes` | list of Sig | `[]` | requests that are writes even when their method is GET, HEAD or OPTIONS |
+| `allow` | list of Sig | `[]` | requests that are reads even when their method is not GET, HEAD or OPTIONS, unless a `writes` signature also matches. A `url` that matches the empty string is refused; one not anchored with `^` prints a warning (below) |
+| `writes` | list of Sig | `[]` | requests that are writes even when their method is GET, HEAD or OPTIONS, and even when an `allow` signature matches too |
 | `controls.text` | list of regex sources | `[]` | extra label patterns that make a control destructive |
 | `controls.icons` | list of class name prefixes | `[]` | a control with a class starting with one of these is destructive |
 | `defaultControls` | boolean | `true` | include the 11 built-in verbs (listed under Writes and controls) in the label pattern; `false` drops them |
@@ -343,10 +357,18 @@ A **Sig** (request signature) is `{ "method": M, "url": U, "body": B, "headers":
 - `body` is optional (absent or `null` means the Sig names no body): a regex source, compiled the same way and tested against the request body. A signature with a `body` never matches a request that has no body (a body that is `null` or absent).
 - `headers` is optional (absent or `null` means the Sig names no headers): an object mapping a header name to a regex source, for example `{ "Next-Action": "^[0-9a-f]+$" }`. Header names compare case-insensitively (they are compiled to lower case). Each value is compiled with no flags and tested, unanchored, against the value of that header on the request. A Sig with `headers` matches a request only when every header it names is present on the request and its value matches.
 - A request matches a Sig when its method, its URL, (when the Sig has one) its body and (when the Sig names any) every named header all match.
+- An `allow` Sig whose `url`, compiled with no flags, matches the empty string (`.*`, `^`, `x?`, `(?:)`, an alternative that is empty) can match any URL, so `compileConfig` throws `write-guard: allow[<i>].url: matches the empty string, so it can match any URL`. A `writes` Sig is not checked this way.
+- An `allow` Sig whose `url` is a string that does not start with `^` is accepted, but `install` prints `write-guard: warning: allow[<i>].url: not anchored with ^, so it also matches any URL that merely contains a match` with `console.warn`, once per distinct text per process, after the config compiles. It prints from Node only: never in a page, and `compileConfig` prints nothing.
 
 ### Writes and controls
 
-**A request is a write** when its method, upper-cased, is not GET, HEAD or OPTIONS, or it matches a `writes` signature, **and** it matches no `allow` signature. The method is upper-cased before the GET, HEAD or OPTIONS check. `allow` always wins: `{ "method": "POST", "url": "^https://app[.]example[.]com/graphql" }` in `allow` lets a read-only GraphQL endpoint through.
+**A request is a write** by the first of these rules that applies, in this order:
+
+1. It matches a `writes` signature: it is a write, whatever its method and whatever `allow` says. `writes` always wins.
+2. Otherwise, it matches an `allow` signature: it is a read.
+3. Otherwise, its method, upper-cased, is not GET, HEAD or OPTIONS: it is a write. A GET, HEAD or OPTIONS is a read.
+
+A write is `block` under `read-only` and `observe` under `observe`; a read is `allow`. For example, `{ "method": "POST", "url": "^https://app[.]example[.]com/graphql" }` in `allow` lets a GraphQL endpoint through, and `{ "method": "POST", "url": "^https://app[.]example[.]com/graphql", "body": "mutation" }` in `writes` still blocks its mutations, because `writes` is checked first.
 
 **A request is suspect** when its method, upper-cased, is GET or HEAD and its URL matches the suspect pattern. The suspect pattern is the built-in pattern (unless `defaultSuspectGets` is `false`) plus every `suspectGets` source, joined into one case-insensitive regex. It is tested, unanchored, against the URL's path plus query (`pathname` followed by `search`, never the origin or the hash) when the URL parses as an absolute URL, and against the URL as given when it is relative or does not parse. The built-in pattern is:
 
@@ -425,7 +447,7 @@ decideSuspect({ method: 'GET', url: 'https://app.example.com/logout' }, config);
 
 ### The installer: `playwright-write-guard/install`
 
-`install(context, config?)` guards one Playwright `BrowserContext` and returns `Promise<GuardHandle>`. It compiles `config` (default `{}`) with `compileConfig`, so a malformed config throws before anything is installed. A second call on the same context returns the first call's handle and ignores its own `config`. It:
+`install(context, config?)` guards one Playwright `BrowserContext` and returns `Promise<GuardHandle>`. It compiles `config` (default `{}`) with `compileConfig`, so a malformed config throws before anything is installed (an `allow` URL that matches the empty string included). Once the config compiles, it prints the warning for each unanchored `allow` URL (see Sig), once per process. A second call on the same context returns the first call's handle and ignores its own `config`. It:
 
 1. Registers one catch-all `context.route`, matching every URL, before anything else. Page handlers run before context handlers, and context handlers run in reverse order of registration, so in the guard's process the catch-all is the last of the handlers registered after `install`.
 2. Wraps `context.route` and the `route` of every page in the context, present and future. A handler registered through them receives every request, blocked writes included, and gets a route on which:
@@ -512,14 +534,14 @@ If the binding `__writeGuardReport` is already registered on the context, anothe
 
 **The handle.**
 
-- `record()` returns `{ installed: true, policy, routed_requests, blocked, observed, mocked, suspect, events }`: `routed_requests` counts the requests the guard judged at browser egress, each once, at its first egress, and no WebSockets, mocks or request-client sends; `blocked` and `observed` count request, control and websocket events by their `action` (`"block"` or `"observe"`), and websocket `open` events count in neither; `mocked` counts request events with `action: "mocked"`, and `suspect` request events with `action: "suspect"`. Each event counts in at most one of `blocked`, `observed`, `mocked` and `suspect`.
+- `record()` returns `{ installed: true, policy, config_file, routed_requests, blocked, observed, mocked, suspect, events }`: `config_file` is the `configFile` of the raw config when that is a string (what `loadConfig` sets: the absolute path it read), else `null`, so a config passed as a plain object records `null`; `routed_requests` counts the requests the guard judged at browser egress, each once, at its first egress, and no WebSockets, mocks or request-client sends; `blocked` and `observed` count request, control and websocket events by their `action` (`"block"` or `"observe"`), and websocket `open` events count in neither; `mocked` counts request events with `action: "mocked"`, and `suspect` request events with `action: "suspect"`. Each event counts in at most one of `blocked`, `observed`, `mocked` and `suspect`.
 - `close()` resolves after the last pending log append and returns the final `record()`. The guard stays active until the context closes.
 - `guardRequestClient(client, { baseURL })` returns a wrapper over the `APIRequestContext` `client` whose sends are judged as described under Request clients, with this guard's config, and recorded in this guard's record and log with `via: "request-client"`. `baseURL` is optional; without it, a relative URL is judged as the raw string. Every property that is not a send method reads through to `client`, with methods bound to the raw client. The fixture judges and records the `request` fixture's sends this way in a test and its `beforeEach` and `afterEach` hooks.
 - `guardFetch(fetchFn)` returns a function with `fetchFn`'s signature that judges each call as described under Request clients, with this guard's config, records it in this guard's record and log with `via: "node-fetch"`, and then either rejects or returns `fetchFn(input, init)` called with the same arguments. The fixture uses it for Node's global `fetch` while a test runs.
 
 **The audit log.** When `config.log` is a path, each event is appended to that file as one JSON line, as it happens. The path is relative to the process's working directory; the file is created when missing and never truncated.
 
-**`loadConfig(path?)`** returns a raw config to pass to `install`. It reads, synchronously with `fs.readFileSync`, the first of: `path`; else the file named by the environment variable `WRITE_GUARD_CONFIG`; else `write-guard.config.json` when that file exists; else it uses `{}`. Relative paths resolve against the process's working directory. A file named by `path` or `WRITE_GUARD_CONFIG` must exist, or `loadConfig` throws. When the environment variable `WRITE_GUARD_POLICY` is set to a non-empty value, it overrides `policy`. The result is validated with `compileConfig`, so a file that does not parse as JSON, an invalid config or an invalid `WRITE_GUARD_POLICY` throws. A file that cannot be read throws `write-guard: <file>: cannot be read: <system message>`, and a file that does not parse throws `write-guard: <file>: is not valid JSON: <parser message>`, where `<file>` is the path as resolved. Every entry point below that defaults to `loadConfig()` therefore honours `WRITE_GUARD_CONFIG` and `WRITE_GUARD_POLICY`; a config you pass explicitly to `install`, `test.use` or `startGuardedBrowser` is used as given.
+**`loadConfig(path?)`** returns a raw config to pass to `install`, with one extra key, `configFile`: the absolute path of the file it read, or `null` when it read no file (a `configFile` key inside the file is overwritten). `compileConfig` ignores `configFile`, `install` records it as `config_file` and never embeds it in a page, and the launcher prints it. It reads, synchronously with `fs.readFileSync`, the first of: `path`; else the file named by the environment variable `WRITE_GUARD_CONFIG`; else `write-guard.config.json` when that file exists; else it uses `{}`. Relative paths resolve against the process's working directory. A file named by `path` or `WRITE_GUARD_CONFIG` must exist, or `loadConfig` throws. When the environment variable `WRITE_GUARD_POLICY` is set to a non-empty value, it overrides `policy`. The result is validated with `compileConfig`, so a file that does not parse as JSON, an invalid config or an invalid `WRITE_GUARD_POLICY` throws. A file that cannot be read throws `write-guard: <file>: cannot be read: <system message>`, and a file that does not parse throws `write-guard: <file>: is not valid JSON: <parser message>`, where `<file>` is the path as resolved. Every entry point below that defaults to `loadConfig()` therefore honours `WRITE_GUARD_CONFIG` and `WRITE_GUARD_POLICY`; a config you pass explicitly to `install`, `test.use` or `startGuardedBrowser` is used as given.
 
 ### The Playwright Test fixture: `playwright-write-guard/test`
 
@@ -534,7 +556,8 @@ test('lists items without changing them', async ({ page }) => {
 });
 ```
 
-- `test` and `expect` are Playwright Test's, extended with one option fixture, `writeGuardConfig`, settable with `test.use`. It defaults to `loadConfig()`, which resolves relative to the working directory: running Playwright with `-c` from another directory needs `WRITE_GUARD_CONFIG` to find the config.
+- `test` and `expect` are Playwright Test's, extended with two option fixtures, `writeGuardConfig` and `writeGuardFailOnBlocked`, settable with `test.use` or the config's `use`. `writeGuardConfig` defaults to `loadConfig()`, which resolves relative to the working directory: running Playwright with `-c` from another directory needs `WRITE_GUARD_CONFIG` to find the config.
+- `writeGuardFailOnBlocked` is a boolean, `false` by default. At the end of the `context` fixture, after every record is attached, when it is `true` and the test's guard and every context made in the test blocked more than 0 events in all, the fixture throws `write-guard: <n> blocked event(s) and writeGuardFailOnBlocked is set: <items>`, where `<n>` is that total and `<items>` lists the first 5 blocked events in order, joined by `; `, each as `request <METHOD> <URL>`, `control "<label>"` or `websocket <URL>`. Only recorded blocks count: `mocked`, `suspect` and `observe` events never do (so nothing counts under `observe`), nor do a `request` fixture send in a `beforeAll` or `afterAll` hook, or the refusals of a page that is being left, because none of them is recorded.
 - The `context` fixture is created with `serviceWorkers: 'block'` and guarded with `install`, with `log` forced to `null` (the fixture never writes a log file). That also judges every send through `context.request` and `page.request` (installer step 7). A test whose effective `serviceWorkers` option is not `'block'` fails at fixture setup with an error starting `write-guard: serviceWorkers is`, because a service worker could send requests the guard never sees. This is the test's guard: its record is `write-guard.json`.
 - The `request` fixture works under both policies, and does not depend on the `context` fixture (Playwright 1.64 refuses `context` in a `beforeAll` or `afterAll` hook). Playwright creates it with `playwright.request.newContext()` (the one call of that method the fixture lets through). Each send through it is judged as described under Request clients, on its effective request with `baseURL` the `baseURL` fixture, so a GET goes through and, under `read-only`, a write rejects without sending. Where the send is recorded depends on where it is made:
   - In a test and its `beforeEach` and `afterEach` hooks, each send is judged and recorded by the test's guard (the `context` fixture's), looked up when the send is made, as that guard's `guardRequestClient(request, { baseURL })` judges and records it; its events (`via: "request-client"`) are in `write-guard.json`.
@@ -593,7 +616,7 @@ The command does the same from a shell:
 npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]
 ```
 
-`--config` is passed to `loadConfig` (so without it, `WRITE_GUARD_CONFIG` and `write-guard.config.json` apply), `--headed` sets `headless` to false, and `--host` and `--port` default to `127.0.0.1` and `0`. It prints `endpoint: <ws endpoint>` on a line of its own, then how to attach: Playwright MCP with `--endpoint <ws endpoint>` and without `--isolated` (which uses `contexts()[0]`), or the Playwright CLI with `playwright-cli attach --endpoint=<ws endpoint>`. It stays up until SIGINT or SIGTERM, then closes the browser and exits 0. An unknown flag or a flag missing its value prints the usage line and exits 1.
+`--config` is passed to `loadConfig` (so without it, `WRITE_GUARD_CONFIG` and `write-guard.config.json` apply), `--headed` sets `headless` to false, and `--host` and `--port` default to `127.0.0.1` and `0`. Its first output line is `config: <path>`, the file `loadConfig` read, or `config: none, using the defaults` when it read none. It then prints `endpoint: <ws endpoint>` on a line of its own, then how to attach: Playwright MCP with `--endpoint <ws endpoint>` and without `--isolated` (which uses `contexts()[0]`), or the Playwright CLI with `playwright-cli attach --endpoint=<ws endpoint>`. It stays up until SIGINT or SIGTERM, then closes the browser and exits 0. An unknown flag or a flag missing its value prints the usage line and exits 1.
 
 ### The suggest command: `playwright-write-guard-suggest`
 
@@ -649,6 +672,7 @@ and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add an anchor
 - In launcher mode, mocking a blocked write from a client's `context.route`: that handler runs after the guard's catch-all, so it never receives a blocked write. A client's `page.route` can mock one.
 - Mocks outside the guard's process: a write that one of your own routes fulfills or aborts in the guard's process is recorded as `mocked`, but in launcher mode a client's routes run in the client's process, so their mocks are not recorded. A `fulfill` or `abort` of a request that already went through `route.fetch()` records nothing (the fetch was judged), and a GET that a route fulfills or aborts is never recorded as `suspect`. A mock is not counted in `blocked` or `observed`, so a broad stub such as `page.route('**/api/**', ...)` keeps its writes out of those counts; look at `mocked`.
 - A `request` fixture send in a `beforeAll` or `afterAll` hook: it is judged but not recorded, because no test guard exists there, so a run's record and log do not list it.
+- `writeGuardFailOnBlocked` counts only recorded blocks: it does not fail a test for a `request` fixture send refused in a `beforeAll` or `afterAll` hook, or for a leaving page's refusals, because neither is recorded. `mocked`, `suspect` and `observe` events never count either.
 - The launcher's browser and context options: it takes no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials.
 - The HTTP cache: Playwright turns it off while a route is installed.
 - Service workers: `register()` resolves but `navigator.serviceWorker.ready` never settles.
