@@ -1126,10 +1126,10 @@ test('the record names the config file that was loaded', async ({ browser }, tes
 });
 
 test('an unanchored allow URL prints one warning per process', async ({ browser }) => {
-  // The text names only the index, so this test uses a high one that no other test in the
+  // The text names the index and the URL, so this test uses a URL that no other test in the
   // process has used. Every entry before it is anchored.
   const anchored = Array.from({ length: 9 }, () => ({ method: 'GET', url: '^https://app[.]test/ok' }));
-  const text = 'write-guard: warning: allow[9].url: not anchored with ^, so it also matches any URL that merely contains a match';
+  const text = 'write-guard: warning: allow[9].url "/report-view": not anchored with ^, so it also matches any URL that merely contains a match';
   const warnings = [];
   const warn = console.warn;
   console.warn = (...args) => { warnings.push(args.join(' ')); };
@@ -1146,6 +1146,77 @@ test('an unanchored allow URL prints one warning per process', async ({ browser 
     console.warn = warn;
     for (const c of contexts) await c.close();
   }
+});
+
+test('two configs with an unanchored URL at the same index both warn', async ({ browser }) => {
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  const contexts = [await browser.newContext(), await browser.newContext()];
+  try {
+    await install(contexts[0], { log: null, allow: [{ method: 'GET', url: '/first-config-view' }] });
+    await install(contexts[1], { log: null, allow: [{ method: 'GET', url: '/second-config-view' }] });
+    expect(warnings).toEqual([
+      'write-guard: warning: allow[0].url "/first-config-view": not anchored with ^, so it also matches any URL that merely contains a match',
+      'write-guard: warning: allow[0].url "/second-config-view": not anchored with ^, so it also matches any URL that merely contains a match',
+    ]);
+  } finally {
+    console.warn = warn;
+    for (const c of contexts) await c.close();
+  }
+});
+
+// The page's console warnings, as they arrive. The guard does not wait for its warning, so a
+// test waits for the text it expects.
+const consoleWarnings = (page) => {
+  const seen = [];
+  page.on('console', (m) => { if (m.type() === 'warning') seen.push(m.text()); });
+  return seen;
+};
+
+test("a blocked fetch warns in its frame's console",async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await open(context);
+  const seen = consoleWarnings(page);
+
+  expect(await send(page, 'POST')).toBe('network error');
+  const reason = guard.record().events[0].reason;
+  await expect.poll(() => seen).toContain(`write-guard refused POST ${APP}/api/items: ${reason}`);
+  expect(server.writes()).toEqual([]);
+});
+
+test('a blocked navigation does not warn in the console', async ({ context }) => {
+  const server = await serve(context);
+  await install(context, { log: null });
+  const page = await open(context);
+  const seen = consoleWarnings(page);
+  // The navigating frame is replaced by the 403 page, so a warning sent to it may never reach
+  // the console: record what is sent to the frame as well.
+  const frame = page.mainFrame();
+  const sent = [];
+  const evaluate = frame.evaluate.bind(frame);
+  frame.evaluate = (fn, arg) => { sent.push(arg); return evaluate(fn, arg); };
+
+  await page.click('#go');
+  await expect(page.locator('body')).toHaveText(`write-guard blocked POST ${APP}/api/items`);
+  await page.evaluate(() => 0);
+  expect(sent.filter((a) => typeof a === 'string' && a.startsWith('write-guard refused '))).toEqual([]);
+  expect(seen.filter((t) => t.startsWith('write-guard refused '))).toEqual([]);
+  expect(server.writes()).toEqual([]);
+});
+
+test('observe does not warn about a request in the console', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null, policy: 'observe' });
+  const page = await open(context);
+  const seen = consoleWarnings(page);
+
+  expect(await send(page, 'POST')).toBe(SERVED);
+  await page.evaluate(() => 0);
+  expect(guard.record().observed).toBe(1);
+  expect(seen.filter((t) => t.startsWith('write-guard refused '))).toEqual([]);
+  expect(server.writes()).toEqual([`POST /api/items`]);
 });
 
 test('an empty WRITE_GUARD_POLICY is ignored', async ({}, testInfo) => {

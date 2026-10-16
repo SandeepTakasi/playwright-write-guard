@@ -36,7 +36,7 @@ const warned = new Set();
 function warnUnanchored(config) {
   (config?.allow ?? []).forEach((s, i) => {
     if (typeof s.url !== 'string' || s.url.startsWith('^')) return;
-    const text = `allow[${i}].url: not anchored with ^, so it also matches any URL that merely contains a match`;
+    const text = `allow[${i}].url ${JSON.stringify(s.url)}: not anchored with ^, so it also matches any URL that merely contains a match`;
     if (warned.has(text)) return;
     warned.add(text);
     console.warn(`write-guard: warning: ${text}`);
@@ -109,6 +109,12 @@ async function setup(context, raw, cfg) {
       if (req.resourceType() === 'document') {
         return route.fulfill({ status: 403, contentType: 'text/html; charset=utf-8', body: blockedPage(r.method, r.url) });
       }
+      // Not awaited, and an error (a detached frame, a worker request) is ignored: the page
+      // otherwise sees only a network error.
+      try {
+        const message = `write-guard refused ${r.method} ${r.url}: ${decideRequest(r, cfg).reason}`;
+        req.frame().evaluate((m) => console.warn(m), message).catch(() => {});
+      } catch { /* a request with no frame */ }
       return route.abort('blockedbyclient');
     }
     // fallback, never continue, so handlers registered behind the catch-all still run.
