@@ -6,7 +6,7 @@ import { test, expect, chromium } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { startGuardedBrowser } from '../src/browser.mjs';
@@ -314,10 +314,43 @@ async function runCommand(args, testInfo) {
   let err = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (d) => { err += d; });
-  return { child, exited, stderr: () => err, endpoint: out.match(/^endpoint: (\S+)$/m)?.[1] };
+  return { child, exited, stderr: () => err, stdout: () => out, config, endpoint: out.match(/^endpoint: (\S+)$/m)?.[1] };
 }
 
 test.describe('the command', () => {
+  test('the command prints which config it loaded', async ({}, testInfo) => {
+    const named = await runCommand(['--port', '0'], testInfo);
+    try {
+      expect(named.stdout().split('\n')[0]).toBe(`config: ${named.config}`);
+    } finally {
+      named.child.kill('SIGTERM');
+    }
+    expect(await named.exited).toEqual({ code: 0, signal: null });
+
+    // No --config, no environment variable, and no write-guard.config.json in an empty directory.
+    const cwd = testInfo.outputPath('empty');
+    mkdirSync(cwd, { recursive: true });
+    const env = { ...process.env };
+    delete env.WRITE_GUARD_CONFIG;
+    delete env.WRITE_GUARD_POLICY;
+    const child = spawn(process.execPath, [BIN, '--port', '0'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000, killSignal: 'SIGKILL' });
+    const exited = new Promise((done) => child.on('close', (code, signal) => done({ code, signal })));
+    try {
+      let out = '';
+      child.stdout.setEncoding('utf8');
+      await new Promise((done, fail) => {
+        child.stdout.on('data', (d) => { out += d; if (out.includes('Stop with Ctrl+C.\n')) done(); });
+        child.on('exit', () => fail(new Error(`exited early: ${out}`)));
+      });
+      expect(out.split('\n')[0]).toBe('config: none, using the defaults');
+    } finally {
+      // The signal handlers are swapped right after the last line, so give them a moment.
+      await new Promise((done) => setTimeout(done, 300));
+      child.kill('SIGTERM');
+    }
+    expect(await exited).toEqual({ code: 0, signal: null });
+  });
+
   test('the command honours --host and --port', async ({}, testInfo) => {
     const probe = net.createServer();
     await new Promise((done) => probe.listen(0, '127.0.0.1', done));

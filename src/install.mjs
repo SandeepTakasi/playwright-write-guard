@@ -23,8 +23,24 @@ const guarded = new WeakMap();
 export async function install(context, config = {}) {
   // Synchronous up to here, so concurrent calls (one per new tab) share one install. A
   // malformed config throws before anything is stored or installed.
-  if (!guarded.has(context)) guarded.set(context, setup(context, config, compileConfig(config)));
+  if (!guarded.has(context)) {
+    const cfg = compileConfig(config);
+    warnUnanchored(config);
+    guarded.set(context, setup(context, config, cfg));
+  }
   return guarded.get(context);
+}
+
+// Each distinct warning is printed once per process, so a fixture that installs per test is not noisy.
+const warned = new Set();
+function warnUnanchored(config) {
+  (config?.allow ?? []).forEach((s, i) => {
+    if (typeof s.url !== 'string' || s.url.startsWith('^')) return;
+    const text = `allow[${i}].url: not anchored with ^, so it also matches any URL that merely contains a match`;
+    if (warned.has(text)) return;
+    warned.add(text);
+    console.warn(`write-guard: warning: ${text}`);
+  });
 }
 
 async function setup(context, raw, cfg) {
@@ -38,6 +54,7 @@ async function setup(context, raw, cfg) {
   const record = () => ({
     installed: true,
     policy: cfg.policy,
+    config_file: typeof raw?.configFile === 'string' ? raw.configFile : null,
     routed_requests: routed,
     blocked: counts.block,
     observed: counts.observe,
@@ -128,7 +145,9 @@ async function setup(context, raw, cfg) {
     });
   });
 
-  await context.addInitScript({ content: pageScript(raw) });
+  // `configFile` stays out of the page: it names a path on the host.
+  const { configFile, ...forPage } = raw ?? {};
+  await context.addInitScript({ content: pageScript(forPage) });
 
   // One wrapper for the context's client; a page's `request` is the same object.
   const client = judgeClient(context.request, cfg, { baseURL, emit });
@@ -520,7 +539,8 @@ function pageScript(raw) {
 
 /**
  * Read a raw config: `path`, else WRITE_GUARD_CONFIG, else write-guard.config.json when it
- * exists, else {}. WRITE_GUARD_POLICY, when non-empty, overrides `policy`. Validated, returned raw.
+ * exists, else {}. WRITE_GUARD_POLICY, when non-empty, overrides `policy`. Validated, returned raw,
+ * with `configFile` set to the absolute path read, or null when no file was read.
  */
 export function loadConfig(path) {
   const named = path || process.env.WRITE_GUARD_CONFIG;
@@ -534,5 +554,5 @@ export function loadConfig(path) {
   const policy = process.env.WRITE_GUARD_POLICY;
   if (policy && raw !== null && typeof raw === 'object' && !Array.isArray(raw)) raw = { ...raw, policy };
   compileConfig(raw);
-  return raw;
+  return { ...raw, configFile: file };
 }

@@ -35,6 +35,8 @@ try {
 }
 
 const ws = guarded.wsEndpoint;
+const file = guarded.guard.record().config_file;
+console.log(file === null ? 'config: none, using the defaults' : `config: ${file}`);
 console.log(`endpoint: ${ws}`);
 console.log('Attach one of:');
 console.log(`  Playwright MCP: --endpoint ${ws} (without --isolated, which would make a new, unguarded context)`);

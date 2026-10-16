@@ -78,6 +78,11 @@ export type GuardEvent = RequestEvent | ControlEvent | WebSocketEvent;
 export interface GuardRecord {
   installed: true;
   policy: Policy;
+  /**
+   * The absolute path of the config file `loadConfig` read, or `null` when the config was an
+   * object that came from no file. Taken from the config's `configFile` key.
+   */
+  config_file: string | null;
   /** Requests the guard judged at browser egress, each counted once, at its first egress. No WebSockets, mocks or request-client sends. */
   routed_requests: number;
   /** Request, control and websocket events with `action: "block"`. */
@@ -123,6 +128,7 @@ export function install(context: BrowserContext, config?: Config): Promise<Guard
 /**
  * Read a config: `path`, else `WRITE_GUARD_CONFIG`, else `write-guard.config.json` when it
  * exists, else `{}`. `WRITE_GUARD_POLICY`, when set, overrides `policy`. Validated through
- * `compileConfig`; returns the raw config.
+ * `compileConfig`; returns the raw config with `configFile` set to the absolute path it read,
+ * or `null` when it read no file (a `configFile` key in the file is overwritten).
  */
-export function loadConfig(path?: string): Config;
+export function loadConfig(path?: string): Config & { configFile: string | null };

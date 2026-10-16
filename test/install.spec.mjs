@@ -920,10 +920,10 @@ test('loadConfig reads a path, then WRITE_GUARD_CONFIG, and honours WRITE_GUARD_
   try {
     delete process.env.WRITE_GUARD_POLICY;
     process.env.WRITE_GUARD_CONFIG = b;
-    expect(loadConfig()).toEqual({ log: null });
-    expect(loadConfig(a)).toEqual({ websockets: 'block' });
+    expect(loadConfig()).toEqual({ log: null, configFile: b });
+    expect(loadConfig(a)).toEqual({ websockets: 'block', configFile: a });
     process.env.WRITE_GUARD_POLICY = 'observe';
-    expect(loadConfig(a)).toEqual({ websockets: 'block', policy: 'observe' });
+    expect(loadConfig(a)).toEqual({ websockets: 'block', policy: 'observe', configFile: a });
     process.env.WRITE_GUARD_POLICY = 'anything';
     expect(() => loadConfig(a)).toThrow(/^write-guard: policy: /);
     delete process.env.WRITE_GUARD_POLICY;
@@ -1075,10 +1075,76 @@ test('the default config file is found', async ({}, testInfo) => {
   try {
     process.chdir(dir);
     await withEnv({ WRITE_GUARD_CONFIG: undefined, WRITE_GUARD_POLICY: undefined }, () => {
-      expect(loadConfig()).toEqual({ policy: 'observe' });
+      expect(loadConfig()).toEqual({ policy: 'observe', configFile: join(dir, 'write-guard.config.json') });
     });
   } finally {
     process.chdir(cwd);
+  }
+});
+
+test('loadConfig names the file it read, overwrites a configFile key, and gives null for no file', async ({}, testInfo) => {
+  const dir = testInfo.outputPath('none');
+  mkdirSync(dir, { recursive: true });
+  const file = testInfo.outputPath('claims.json');
+  writeFileSync(file, JSON.stringify({ configFile: '/elsewhere.json' }));
+  const cwd = process.cwd();
+  try {
+    process.chdir(dir);
+    await withEnv({ WRITE_GUARD_CONFIG: undefined, WRITE_GUARD_POLICY: undefined }, () => {
+      expect(loadConfig()).toEqual({ configFile: null });
+      expect(loadConfig(file).configFile).toBe(file);
+    });
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test('the record names the config file that was loaded', async ({ browser }, testInfo) => {
+  const file = testInfo.outputPath('write-guard.json');
+  writeFileSync(file, JSON.stringify({ log: null }));
+  const fromFile = await browser.newContext();
+  const fromObject = await browser.newContext();
+  try {
+    // What the page is handed must not carry the file name.
+    const scripts = [];
+    const addInitScript = fromFile.addInitScript.bind(fromFile);
+    fromFile.addInitScript = (script, ...rest) => { scripts.push(script.content ?? ''); return addInitScript(script, ...rest); };
+
+    const a = await install(fromFile, loadConfig(file));
+    const b = await install(fromObject, { log: null });
+
+    expect(a.record().config_file).toBe(file);
+    expect(Object.keys(a.record()).slice(0, 3)).toEqual(['installed', 'policy', 'config_file']);
+    expect(b.record().config_file).toBeNull();
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]).not.toContain('configFile');
+    expect(scripts[0]).not.toContain(file);
+  } finally {
+    await fromFile.close();
+    await fromObject.close();
+  }
+});
+
+test('an unanchored allow URL prints one warning per process', async ({ browser }) => {
+  // The text names only the index, so this test uses a high one that no other test in the
+  // process has used. Every entry before it is anchored.
+  const anchored = Array.from({ length: 9 }, () => ({ method: 'GET', url: '^https://app[.]test/ok' }));
+  const text = 'write-guard: warning: allow[9].url: not anchored with ^, so it also matches any URL that merely contains a match';
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  const contexts = [await browser.newContext(), await browser.newContext(), await browser.newContext()];
+  try {
+    await install(contexts[0], { log: null, allow: [...anchored, { method: 'GET', url: '/report-view' }] });
+    await install(contexts[1], { log: null, allow: [...anchored, { method: 'GET', url: '/report-view' }] });
+    expect(warnings).toEqual([text]);
+
+    warnings.length = 0;
+    await install(contexts[2], { log: null, allow: [...anchored, { method: 'GET', url: '^https://app[.]test/report' }, { method: 'GET', url: '^/x' }] });
+    expect(warnings).toEqual([]);
+  } finally {
+    console.warn = warn;
+    for (const c of contexts) await c.close();
   }
 });
 
