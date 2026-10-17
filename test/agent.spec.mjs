@@ -6,6 +6,7 @@ import { test, expect, chromium } from '@playwright/test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
@@ -299,7 +300,7 @@ test('the launcher binds under its title', async ({}, testInfo) => {
 async function runCommand(args, testInfo) {
   const config = testInfo.outputPath('config.json');
   writeFileSync(config, JSON.stringify({ log: null }));
-  const child = spawn(process.execPath, [BIN, '--config', config, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [BIN, '--config', config, ...args], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000, killSignal: 'SIGKILL' });
   // 'close' comes after the output streams end, so stderr is complete once this resolves.
   const exited = new Promise((done) => child.on('close', (code, signal) => done({ code, signal })));
   let out = '';
@@ -316,6 +317,14 @@ async function runCommand(args, testInfo) {
   child.stderr.on('data', (d) => { err += d; });
   return { child, exited, stderr: () => err, stdout: () => out, config, endpoint: out.match(/^endpoint: (\S+)$/m)?.[1] };
 }
+
+// A throwaway 127.0.0.1 server, plain or HTTPS, and its shutdown.
+async function listen(handler, scheme = 'http', tls = {}) {
+  const server = scheme === 'https' ? createHttpsServer(tls, handler) : createServer(handler);
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  return { server, url: `${scheme}://127.0.0.1:${server.address().port}` };
+}
+const stopServer = (server) => new Promise((done) => { server.close(done); server.closeAllConnections(); });
 
 test.describe('the command', () => {
   test('the command prints which config it loaded', async ({}, testInfo) => {
@@ -459,6 +468,110 @@ test.describe('the command', () => {
     const r = spawnSync(process.execPath, [BIN, '--config', missing], { encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL', env });
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/^write-guard:/);
+  });
+
+  test('the usage line names the launch flags', () => {
+    const r = spawnSync(process.execPath, [BIN, '--nope'], { encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL' });
+    expect(r.stderr.trim()).toBe('usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]');
+  });
+
+  test('the launcher starts logged in with --storage-state', async ({}, testInfo) => {
+    const seen = [];
+    const { server, url } = await listen((req, res) => { seen.push(req.headers.cookie); res.setHeader('content-type', 'text/html').end('<p>dashboard</p>'); });
+    const state = testInfo.outputPath('state.json');
+    writeFileSync(state, JSON.stringify({ cookies: [{ name: 'session', value: 'abc', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }], origins: [] }));
+    const { child, exited, endpoint } = await runCommand(['--port', '0', '--storage-state', state], testInfo);
+    let client;
+    try {
+      client = await chromium.connect(endpoint);
+      const page = await client.contexts()[0].newPage();
+      await page.goto(`${url}/`);
+      expect(seen).toEqual(['session=abc']);
+    } finally {
+      await client?.close().catch(() => {});
+      child.kill('SIGTERM');
+      await stopServer(server);
+    }
+    expect(await exited).toEqual({ code: 0, signal: null });
+  });
+
+  test('the launcher sends through --proxy', async ({}, testInfo) => {
+    // Chromium never proxies 127.0.0.1 or localhost, so the page asks for a .test host and the
+    // proxy, a plain 127.0.0.1 server, answers for it.
+    const seen = [];
+    const { server, url } = await listen((req, res) => { seen.push(`${req.method} ${req.url}`); res.setHeader('content-type', 'text/html').end('<p>from the proxy</p>'); });
+    const { child, exited, endpoint } = await runCommand(['--port', '0', '--proxy', url], testInfo);
+    let client;
+    try {
+      client = await chromium.connect(endpoint);
+      const page = await client.contexts()[0].newPage();
+      await page.goto('http://items.test/home');
+      expect(await page.textContent('p')).toBe('from the proxy');
+      expect(seen).toEqual(['GET http://items.test/home']);
+    } finally {
+      await client?.close().catch(() => {});
+      child.kill('SIGTERM');
+      await stopServer(server);
+    }
+    expect(await exited).toEqual({ code: 0, signal: null });
+  });
+
+  test('the launcher accepts a self-signed certificate with --ignore-https-errors', async ({}, testInfo) => {
+    const dir = testInfo.outputPath('cert');
+    mkdirSync(dir, { recursive: true });
+    const key = `${dir}/key.pem`;
+    const cert = `${dir}/cert.pem`;
+    // The first openssl that runs: a PATH entry can be a binary for another CPU.
+    const args = ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'];
+    let made;
+    for (const bin of ['openssl', '/usr/bin/openssl']) {
+      made = spawnSync(bin, args, { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' });
+      if (!made.error) break;
+    }
+    test.skip(Boolean(made.error), 'openssl is not available');
+    expect(made.status, made.stderr).toBe(0);
+    const { server, url } = await listen((req, res) => res.setHeader('content-type', 'text/html').end('<p>secure</p>'), 'https', { key: readFileSync(key), cert: readFileSync(cert) });
+    try {
+      // Without the flag Chromium refuses the certificate; with it the page loads.
+      const strict = await runCommand(['--port', '0'], testInfo);
+      let client;
+      try {
+        client = await chromium.connect(strict.endpoint);
+        await expect((await client.contexts()[0].newPage()).goto(`${url}/`)).rejects.toThrow(/ERR_CERT/);
+      } finally {
+        await client?.close().catch(() => {});
+        strict.child.kill('SIGTERM');
+      }
+      expect(await strict.exited).toEqual({ code: 0, signal: null });
+
+      const lax = await runCommand(['--port', '0', '--ignore-https-errors'], testInfo);
+      try {
+        client = await chromium.connect(lax.endpoint);
+        const page = await client.contexts()[0].newPage();
+        await page.goto(`${url}/`);
+        expect(await page.textContent('p')).toBe('secure');
+      } finally {
+        await client?.close().catch(() => {});
+        lax.child.kill('SIGTERM');
+      }
+      expect(await lax.exited).toEqual({ code: 0, signal: null });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  test('an unreadable storage state fails at startup', ({}, testInfo) => {
+    const config = testInfo.outputPath('config.json');
+    writeFileSync(config, JSON.stringify({ log: null }));
+    const broken = testInfo.outputPath('broken.json');
+    writeFileSync(broken, '{ not json');
+    for (const state of [testInfo.outputPath('missing.json'), broken]) {
+      const r = spawnSync(process.execPath, [BIN, '--config', config, '--storage-state', state], { encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL' });
+      expect(r.status).toBe(1);
+      expect(r.stderr.trim()).not.toBe('');
+      expect(r.stderr).not.toContain('usage:');
+      expect(r.stdout).not.toContain('endpoint:');
+    }
   });
 });
 

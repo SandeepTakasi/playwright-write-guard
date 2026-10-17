@@ -1,6 +1,6 @@
 // playwright-write-guard/browser: a guarded Chromium that an agent attaches to.
 
-import type { Browser, BrowserContext } from 'playwright-core';
+import type { Browser, BrowserContext, BrowserContextOptions } from 'playwright-core';
 import type { Config } from './core.js';
 import type { GuardHandle } from './install.js';
 
@@ -15,6 +15,12 @@ export interface GuardedBrowserOptions {
   port?: number;
   /** Default `"write-guard"`. */
   title?: string;
+  /** A storage-state file path or object: the context starts with those cookies and local storage. Passed only when defined. */
+  storageState?: BrowserContextOptions['storageState'];
+  /** A Playwright proxy, for example `{ server: 'http://127.0.0.1:8080' }`. Passed only when defined. */
+  proxy?: BrowserContextOptions['proxy'];
+  /** Accept certificate errors, for example a self-signed certificate. Passed only when defined. */
+  ignoreHTTPSErrors?: boolean;
 }
 
 export interface GuardedBrowser {

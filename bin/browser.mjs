@@ -5,12 +5,20 @@ import { parseArgs } from 'node:util';
 import { startGuardedBrowser } from '../src/browser.mjs';
 import { loadConfig } from '../src/install.mjs';
 
-const USAGE = 'usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]';
+const USAGE = 'usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]';
 
 let args;
 try {
   ({ values: args } = parseArgs({
-    options: { config: { type: 'string' }, headed: { type: 'boolean' }, host: { type: 'string' }, port: { type: 'string' } },
+    options: {
+      config: { type: 'string' },
+      headed: { type: 'boolean' },
+      host: { type: 'string' },
+      port: { type: 'string' },
+      'storage-state': { type: 'string' },
+      proxy: { type: 'string' },
+      'ignore-https-errors': { type: 'boolean' },
+    },
   }));
 } catch {
   args = null;
@@ -28,6 +36,9 @@ try {
     headless: !args.headed,
     host: args.host ?? '127.0.0.1',
     port,
+    storageState: args['storage-state'],
+    proxy: args.proxy === undefined ? undefined : { server: args.proxy },
+    ignoreHTTPSErrors: args['ignore-https-errors'],
   });
 } catch (err) {
   console.error(err?.message ?? String(err));

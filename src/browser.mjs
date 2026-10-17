@@ -5,10 +5,14 @@
 import { chromium } from 'playwright-core';
 import { install, loadConfig } from './install.mjs';
 
-export async function startGuardedBrowser({ config = loadConfig(), headless = true, host = '127.0.0.1', port = 0, title = 'write-guard' } = {}) {
+export async function startGuardedBrowser({ config = loadConfig(), headless = true, host = '127.0.0.1', port = 0, title = 'write-guard', storageState, proxy, ignoreHTTPSErrors } = {}) {
   const browser = await chromium.launch({ headless });
   try {
-    const context = await browser.newContext({ serviceWorkers: 'block' });
+    const contextOptions = { serviceWorkers: 'block' };
+    for (const [key, value] of Object.entries({ storageState, proxy, ignoreHTTPSErrors })) {
+      if (value !== undefined) contextOptions[key] = value;
+    }
+    const context = await browser.newContext(contextOptions);
     const guard = await install(context, config);
     const { endpoint } = await browser.bind(title, { host, port });
     return {
