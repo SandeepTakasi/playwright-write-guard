@@ -33,26 +33,33 @@ The read goes through. The click is refused inside the page before the app sees 
 
 ## Recording the README demo
 
-`docs/demo.gif` (the README's demo) is a screen recording of a real Claude Code session: Claude Code in a terminal, a headed guarded browser, and a live log of what the shop server received and what the guard refused. The session runs against the store admin in `demo/shop/`, not against the small app above. You run Claude Code yourself; the scripts in `demo/shop/` set the rest up and record the screen. It needs macOS, Node, Claude Code (`claude`) and the npm registry (Playwright MCP 0.0.83 is fetched with `npx`).
+`docs/demo.gif` (the README's demo) is filmed from a real Claude Code run against the store admin in `demo/shop/` (not the small app above). One command does it, with no windows to arrange, no OS permissions and no keys to press. From the repository root:
 
-1. **Prepare once.**
-   - Grant Screen Recording permission to your terminal app: System Settings, Privacy and Security, Screen Recording, switch the terminal app on, then quit it and open it again. Without it the recorder stops and prints these steps.
-   - The recorder builds the GIF with Python 3 and Pillow: `python3` must be on `PATH` with Pillow installed (`python3 -m pip install --user pillow`), or set `PYTHON` to an interpreter that has it, for example `PYTHON=/usr/bin/python3`.
-   - Fetch Playwright MCP once so the take does not wait for the download: `npx -y @playwright/mcp@0.0.83 --help`.
-2. **Start the shop and the guarded browser.** From the repository root, in a terminal you will not film:
+```
+node demo/shop/film.mjs
+```
 
-   ```
-   node demo/shop/start.mjs
-   ```
+It needs a logged-in Claude Code (`claude` on `PATH`; the run uses your account), Python 3 with Pillow (`python3 -m pip install --user pillow`, or set `PYTHON` to an interpreter that has it, for example `PYTHON=/usr/bin/python3`), and the npm registry (Playwright MCP 0.0.83 is fetched with `npx`).
 
-   It starts the shop, opens a headed guarded browser that is already signed in, and prints five numbered steps with the exact commands: the shop URL, the log pane command, the recorder command, the `claude --mcp-config ...` command (with the `cd` to an empty directory before it) and the prompt to paste. Leave it running; Ctrl+C stops the browser and the shop and removes its temporary files.
-3. **Arrange the windows.** Split the terminal in two: Claude Code on the left, the log pane on the right, and put the guarded browser window beside them, so all three are on screen at once. Run the printed log pane command in the right pane. To record only that part of the screen, give the recorder `--rect x,y,w,h` (points from the top left of the display). A rectangle also keeps the menu bar clock out of the picture, which would otherwise make every minute a new frame.
-4. **Start the recorder.** In a third terminal, outside the filmed area (or minimised), run the printed `node demo/shop/record.mjs`, with `--rect` if you want one. It prints `Recording.` after its first capture succeeded and then counts the frames it has captured. Only the first frame is checked, so look at the finished GIF to be sure the windows are in it.
-5. **Run Claude Code.** In the left pane run the printed `cd` and `claude --mcp-config ...` commands. Claude Code may ask you to approve the Playwright tools the first time; approve them before you start the recorder if you want a clean take. Paste the prompt: "Our staging store has test orders left over from QA. Clean them up, and refund any that were charged."
-6. **Stop the recorder.** When the agent has finished, press Ctrl+C once in the recorder's terminal. It builds the GIF (this takes a while for a long take) and prints the path and size. A second Ctrl+C gives up without building it.
-7. **Check the GIF.** Open `docs/demo.gif` (or the path given with `--out`) and confirm: the windows are visible, the shop is signed in, the agent's attempts are refused, and the log pane footer shows `writes received by the server: 0`.
+What it does:
 
-The recorder takes a still with `screencapture -x -C` about every 250 ms and drops a still that is identical to the one before it. The GIF is at most 1280 px wide, every unchanged stretch over 2 seconds is shortened to 1 second, and it stays under 8 MB: if the first encode is over, the recorder retries with fewer frames and then a smaller width, and prints what it changed. Default output is `docs/demo.gif`; `--out <path>` writes elsewhere. Stills are kept in a temporary directory while recording (a retina display makes them a few megabytes each) and removed at the end.
+1. Starts the shop, a headless guarded browser that is already signed in (viewport 1280x800, the guard's log in a temporary file) with the orders page open, and an MCP config for Playwright MCP 0.0.83 with `--endpoint`.
+2. Runs Claude Code in an empty temporary directory, with a 10 minute limit:
+   `claude -p <prompt> --mcp-config <file> --strict-mcp-config --allowedTools mcp__playwright --output-format stream-json --verbose`.
+   The default prompt is "Our staging store admin is open in the browser. It has test orders left over from QA. Clean them up, and refund any that were charged." Tools other than Playwright MCP's are denied, and the denial shows in the film.
+3. While the agent works it timestamps every stream-json event, takes a browser screenshot from a second client about every 300 ms, and afterwards reads the shop's request log and the guard's log.
+4. `demo/shop/compose.py` turns that timeline into frames on a 1280x720 canvas: the prompt and the agent's messages and tool calls on the left (guard refusals from tool results in yellow, errors in red), the browser on the right, and below it the log pane (server reads dim, server writes red, guard refusals yellow) with the footer `writes received by the server: <n>`. Nothing in a frame is invented: every line comes from the recording.
+5. Prints the agent's final message, how many requests the shop received, how many the guard refused and how many writes reached the server (and names any write that did), then the GIF's path and size. Every process and temporary directory it started is removed.
+
+The GIF plays in real time, except that an unchanged stretch over 2 seconds plays as 1 second; the last frame, with the agent's final message, is held 4 seconds. It stays under 8 MB: over that, `compose.py` retries with fewer frames and then a smaller width, and prints what it changed. Ctrl+C stops the agent early and films what was recorded.
+
+Options:
+
+- `--out <path>` writes the GIF elsewhere (default `docs/demo.gif`).
+- `--prompt <text>` gives the agent another prompt.
+- `--keep <dir>` keeps the timeline and screenshots in `<dir>`, so the GIF can be composed again without another agent run: `python3 demo/shop/compose.py <dir>/timeline.json <out.gif>`.
+
+To explore the shop by hand instead, `node demo/shop/start.mjs` starts the shop and a headed guarded browser that is already signed in, and prints the shop URL, the log pane command (`node demo/shop/log.mjs ...`), the `claude --mcp-config ...` command and the prompt. Ctrl+C stops it and removes its temporary files.
 
 ## A real agent through Playwright MCP
 
