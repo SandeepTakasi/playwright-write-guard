@@ -34,7 +34,15 @@ Logging in is a write, so under read-only a login form is blocked: the page show
   `state.json` holds a live session: keep it out of version control. If the app renews its session token with a POST, the session expires during the run and the app looks broken ("session expired"); allow-list that refresh endpoint as below.
 - **Allow-list the login endpoints**, in any mode: `{ "method": "POST", "url": "^https://app[.]example[.]test/login$" }`, plus the token refresh endpoint if a session must last. Keep these narrow: everything they match is let through.
 - **Playwright MCP in config mode:** start it with `--isolated --storage-state <file>` to begin already logged in (Playwright MCP reads a storage state only for isolated sessions).
-- **Launcher mode** takes no context or launch options yet (no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials): allow-list the login endpoints, or use config mode.
+- **Launcher mode:** start the launcher already logged in with `--storage-state <path>`, a Playwright storage state file such as the `state.json` the setup project above saves:
+
+  ```
+  npx playwright-write-guard-browser --storage-state state.json
+  ```
+
+  The agent then attaches to a browser that holds the session, and never has to log in through the read-only guard. A file that cannot be read or parsed stops the launcher at startup with Playwright's message and exit code 1. The same file keeps the limits above: it holds a live session, so keep it out of version control, and a session the app renews with a POST still expires during the run unless you allow-list that refresh endpoint. From code, pass `storageState` (a path or a storage state object) to `startGuardedBrowser`.
+
+  Two more flags help when the app is not directly reachable. `--proxy <url>` sends the browser's traffic through a proxy (for an app only reachable through a corporate or staging proxy), and `--ignore-https-errors` accepts self-signed or otherwise invalid certificates (for a staging server or a local HTTPS app). Use `--ignore-https-errors` only against hosts you trust: it turns off certificate checks for every page in the guarded browser. The launcher takes no HTTP credentials; allow-list the login endpoints, or use config mode.
 
 ## WebSocket frames and suspect GETs
 
@@ -77,3 +85,40 @@ Apps that read over POST stop working until those endpoints are in `allow`. To f
 
    It reads the log and never writes a file. It groups the `observe`, `block` and `mocked` request events by method and by origin plus path, prints `{ "allow": [...] }` on stdout, one entry per group, and one hint line per entry on stderr: how many events it saw, and a note when the group carries `next-action` or its path ends in `/graphql`. A group of three blocked `POST https://app.example.test/graphql` events gives the entry `{ "method": "POST", "url": "^https://app\\.example\\.test/graphql(?:[?#]|$)" }` and the hint `3 x POST https://app.example.test/graphql: GraphQL, add an anchored body pattern`. Allowed GETs are never logged, and `suspect` events and events without a method are skipped.
 4. **Review before use.** The command cannot tell a read from a write: it lists every write the run attempted, the real ones included, and each entry allows every request with that method to that path, whatever its body or headers. Delete the entries that are real writes. Narrow the rest with a `body` pattern anchored at its start (GraphQL operation names) or a `headers` pattern (exact action IDs), as shown under [Use with Playwright Test](../README.md#use-with-playwright-test). Then put them in `allow`, run again under `read-only`, and check that the reads work and the writes are still blocked.
+
+## Allow and writes examples
+
+An `allow` URL that matches the empty string (`.*`, `^`, `x?`) can match any URL, so the config is refused with `write-guard: allow[0].url: matches the empty string, so it can match any URL`. An `allow` URL that is not anchored with `^` still works, but `install` prints `write-guard: warning: allow[0].url "/api/": not anchored with ^, so it also matches any URL that merely contains a match` (the text names the URL, here `/api/`) once per distinct text per process, from Node and never in a page.
+
+A `writes` signature always wins over `allow`. To let a GraphQL endpoint's reads through and still block its mutations, allow the URL and name the mutations in `writes` by a body pattern:
+
+```json
+{
+  "allow": [{ "method": "POST", "url": "^https://app[.]example[.]test/graphql$" }],
+  "writes": [{ "method": "POST", "url": "^https://app[.]example[.]test/graphql$", "body": "mutation" }]
+}
+```
+
+The body pattern in the README's first example is anchored with `^\{`, so it matches only a single operation whose body starts with its name: a batched request (a JSON array) never matches, and neither does a body that puts `operationName` later. Check that your client sends `operationName` first, or the reads stay blocked (the safe direction). The pattern trusts your app's operation names, so list only names that read, and never leave a pattern unanchored.
+
+Reads that differ from writes only in a header, such as Next.js server actions, can be allow-listed with a `headers` entry that names the exact action IDs that read, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/items$", "headers": { "next-action": "^(7f3a9c21|1b2e44d0)$" } }`. Every server action sends a `next-action` header, writes included, so a pattern that matches any ID allows every action; and action IDs can change between builds, so re-check them after a deploy. Header names compare case-insensitively and each value is a regex tested against that header on the request.
+
+## Playwright Test details
+
+`browser.newContext()` and `browser.newPage()` inside a test return a guarded context, created with `serviceWorkers: 'block'`, so tests with several users can create more contexts. Each one's record is attached as `write-guard-<n>.json`. In hooks and in fixture setup and teardown they still throw (a multi-user fixture that calls `browser.newContext()` fails at setup). `playwright.request.newContext()` and the browser types' `launch` and `connect` family still throw everywhere, because they make clients the guard cannot see.
+
+A test can mock a write: a `page.route` handler that `fulfill`s or `abort`s a POST runs, and the request never leaves the browser. The guard records it as a `mocked` event, which counts in `mocked`, not in `blocked`. A handler that passes the request on with `continue()` or `route.fetch()` is judged at that point, overrides included, so the write is still blocked. A mock is not the server: count writes on a real local server, not through a route that fulfills them.
+
+## Dialogs
+
+Under `read-only` the guard declines every dialog (`alert`, `confirm`, `prompt`, `beforeunload`) first, so a suite's own `accept` on the same dialog throws `Cannot accept dialog which is already handled!`, and its own `dismiss` throws `Cannot dismiss dialog which is already handled!`. The dialog is declined either way; catch the error so the test goes on:
+
+```js
+page.on('dialog', (dialog) => dialog.accept().catch(() => {}));
+```
+
+A dismissed `beforeunload` keeps the page, so a test or an agent that leaves a page with unsaved changes (a `goto` elsewhere, a click on a link) stays on that page. A `page.goto` then throws `net::ERR_ABORTED`; a click on a link does not throw.
+
+## Leaving pages, shared workers and fetchLater
+
+Playwright does not route a request a page starts while it is being left (a `navigator.sendBeacon` or a `keepalive` fetch from a `pagehide` or `unload` handler, or an ordinary `fetch` or XHR then), nor the HTTP of a `SharedWorker`, nor a request made with `fetchLater`, even from a page that stays open. Under `read-only`, the page script judges the writes of a leaving page itself, with the same `allow` list and rules as the network layer: an allowed write goes out, and any other is refused (the beacon returns `false`, the `fetch` rejects, the XHR throws) with a console warning. A frame counts as leaving when it, or a same-origin frame above it, is hidden or has fired `pagehide`, also with a cross-origin frame in between. A refusal is recorded nowhere, because a page that is being left cannot report reliably, and reads from a leaving page are not judged. Under `read-only` the page script also removes `window.SharedWorker` and `window.fetchLater` in every frame, so an app that checks for them falls back to a dedicated `Worker` (routed) or to `fetch` or `sendBeacon` (judged), and an app that calls them without checking does not load that part. Under `observe`, nothing is replaced or removed: unload-time sends, the HTTP of a `SharedWorker` and `fetchLater` requests are not judged and not recorded.

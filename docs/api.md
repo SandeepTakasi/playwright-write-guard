@@ -23,6 +23,7 @@ Every key is optional, and unknown keys are ignored:
   "writes": [],
   "controls": { "text": [], "icons": [] },
   "defaultControls": true,
+  "defaultExceptions": true,
   "websockets": "allow",
   "websocketWrites": [],
   "suspectGets": [],
@@ -40,6 +41,7 @@ Every key is optional, and unknown keys are ignored:
 | `controls.text` | list of regex sources | `[]` | extra label patterns that make a control destructive |
 | `controls.icons` | list of class name prefixes | `[]` | a control with a class starting with one of these is destructive |
 | `defaultControls` | boolean | `true` | include the 11 built-in verbs (listed under Writes and controls) in the label pattern; `false` drops them |
+| `defaultExceptions` | boolean | `true` | include the built-in read-only exception pattern (shown under Writes and controls): a control whose whole label matches it is not refused by label; `false` drops it. Any other value fails with `write-guard: defaultExceptions: must be a boolean` |
 | `websockets` | `"allow"` or `"block"` | `"allow"` | `allow` records each WebSocket open and lets it connect; `block` refuses every WebSocket |
 | `websocketWrites` | list of regex sources | `[]` | under `websockets: "allow"`, an outbound WebSocket text frame matching any of these is a write: dropped under `read-only`, recorded and forwarded under `observe`. Compiled with no flags (case-sensitive) and tested unanchored against the frame's text. Empty: frames are not judged |
 | `suspectGets` | list of regex sources | `[]` | extra patterns that mark a GET or HEAD as suspect (recorded, never blocked), added to the built-in suspect pattern. Compiled case-insensitive and tested unanchored against the URL's path plus query |
@@ -76,6 +78,12 @@ So `/logout`, `/users/sign_out`, `/unsubscribe?t=1` and `/items?action=delete` a
 **A control is destructive** when its label matches the label pattern, or it has a class starting with one of the `controls.icons` prefixes. The label pattern is the built-in verbs (unless `defaultControls` is `false`) plus every `controls.text` source, joined into one case-insensitive regex. The built-in verbs match as whole words, case-insensitive (`Save` and `Delete item` match, `Saved` does not):
 
 `save`, `delete`, `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `log out`, `sign out`, `logout`
+
+**Built-in exceptions.** Unless `defaultExceptions` is `false`, a short list of view-only labels is exempt from the label pattern. The exception pattern is case-insensitive and anchored at both ends, so it matches only the whole trimmed label:
+
+`^(?:(?:remove|clear)\s+filters?|clear\s+search|remove\s+columns?)$`
+
+So `Remove filter`, `Clear filters`, `clear search` and `Remove columns` are not refused by label, while `Remove filter rule permanently`, `Save search` and `Send feedback` still are: only a whole label matches, and there are no exceptions for `save` or `send` phrases. An exception skips only the label check: a control whose icons match `controls.icons` is still refused. When an exception lets a control through, `decideControl` returns `allow` with the reason `"<label>" is a built-in read-only exception`. With `defaultExceptions: false` there are no exceptions. An exception skips the whole text match, so your own `controls.text` patterns are skipped for an excepted label too (an icon match still refuses it). To have `controls.text` apply to those labels, set `defaultExceptions: false`. `Clear filters`, `Clear search` and `Clear filter` contain no built-in verb anyway, so only `Remove filter`, `Remove filters`, `Remove column` and `Remove columns` depend on the exception.
 
 There are no built-in icons: icon libraries differ per app, so name yours in `controls.icons` (for example `"icon-trash"`). An empty label never matches the label pattern; with `defaultControls: false` and no `controls.text`, only icons can make a control destructive.
 
@@ -130,12 +138,13 @@ decideSuspect({ method: 'GET', url: 'https://app.example.com/logout' }, config);
   - a `controls.icons` entry that is not a non-empty string;
   - `controls` that is not an object;
   - `defaultControls` that is not a boolean;
+  - `defaultExceptions` that is not a boolean, which throws `write-guard: defaultExceptions: must be a boolean`;
   - `logBodies` that is not a boolean, which throws `write-guard: logBodies: must be a boolean`;
   - `log` that is neither a non-empty string nor `null`.
 
-  The result is `{ policy, allow, writes, text, icons, websockets, websocketWrites, suspect, log, logBodies }`: `allow` and `writes` hold `{ method, url: RegExp, body: RegExp | null, headers: Array<{ name: string, value: RegExp }> }`, where `method` is `"*"` or the method name in upper case and `headers` holds one entry per named header, its `name` in lower case (empty when the Sig names none); `text` is the label pattern (`null` when there is none); `icons` is `controls.icons`; `websocketWrites` is a `RegExp[]`, one per source, each compiled with no flags (empty by default); `suspect` is the suspect pattern, a single case-insensitive `RegExp` made of the built-in pattern (unless `defaultSuspectGets` is `false`) and every `suspectGets` source, each wrapped in `(?:...)` and joined with `|`, or `null` when there are none; `logBodies` is `false` unless the config sets it to `true`.
+  The result is `{ policy, allow, writes, text, exceptions, icons, websockets, websocketWrites, suspect, log, logBodies }`: `allow` and `writes` hold `{ method, url: RegExp, body: RegExp | null, headers: Array<{ name: string, value: RegExp }> }`, where `method` is `"*"` or the method name in upper case and `headers` holds one entry per named header, its `name` in lower case (empty when the Sig names none); `text` is the label pattern (`null` when there is none); `exceptions` is the built-in exception pattern (a case-insensitive `RegExp`, `null` when `defaultExceptions` is `false`); `icons` is `controls.icons`; `websocketWrites` is a `RegExp[]`, one per source, each compiled with no flags (empty by default); `suspect` is the suspect pattern, a single case-insensitive `RegExp` made of the built-in pattern (unless `defaultSuspectGets` is `false`) and every `suspectGets` source, each wrapped in `(?:...)` and joined with `|`, or `null` when there are none; `logBodies` is `false` unless the config sets it to `true`.
 - `decideRequest({ method, url, body, headers }, compiled)` returns `{ action, reason }`. `body` is `null` or absent when the request has none. `headers` is an object of header name to value, names in any case (`decideRequest` lower-cases them itself), absent when the request has none, in which case no Sig that names headers matches. For a write, `action` is `"block"` under `read-only` and `"observe"` under `observe`; for anything else it is `"allow"`.
-- `decideControl({ label, icons }, compiled)` returns `{ action, reason }`. For a destructive control, `action` is `"block"` under `read-only` and `"observe"` under `observe`; for anything else it is `"allow"`.
+- `decideControl({ label, icons }, compiled)` returns `{ action, reason }`. For a destructive control, `action` is `"block"` under `read-only` and `"observe"` under `observe`; for anything else it is `"allow"`. When `compiled.exceptions` matches the trimmed label, the label pattern is skipped (an icon match still makes the control destructive), and an allowed control's reason is `"<label>" is a built-in read-only exception`.
 - `decideFrame(text, compiled)` returns `{ action, reason }` for one outbound WebSocket frame. When `text` is a string that matches any `compiled.websocketWrites` pattern (tested unanchored), `action` is `"block"` under `read-only` and `"observe"` under `observe`. A string that matches none, and a frame that is not a string (a binary frame), are always `"allow"`. With an empty `websocketWrites`, every frame is `"allow"`.
 - `decideSuspect({ method, url }, compiled)` returns `{ suspect, reason }`, where `suspect` is a boolean. It is `true` only when `method`, upper-cased, is `GET` or `HEAD`, `compiled.suspect` is not `null`, and `compiled.suspect` matches the tested string: the URL's `pathname` followed by its `search` when `new URL(url)` parses it, else `url` as given (a relative or unparsable URL). It never depends on the policy: a suspect request is recorded, never blocked, by the callers described under the installer.
 - `reason` is a short human-readable explanation; its wording is not part of the API.
@@ -304,17 +313,23 @@ Without those entries the agent can remove the guard.
 
 ## The launcher: `playwright-write-guard/browser`
 
-`startGuardedBrowser({ config, headless = true, host = '127.0.0.1', port = 0, title = 'write-guard' })` returns `Promise<{ wsEndpoint, browser, context, guard, close() }>`. It launches Chromium with `playwright-core`, creates one context with `serviceWorkers: 'block'`, guards it with `install(context, config)` (`config` defaults to `loadConfig()`), and calls `browser.bind(title, { host, port })`; `wsEndpoint` is the `endpoint` that returns, `ws://<host>:<port>/<id>` (`port: 0` lets the OS pick a free port). `guard` is the install handle. `close()` waits for `guard.close()`, then closes the context and the browser.
+`startGuardedBrowser({ config, headless = true, host = '127.0.0.1', port = 0, title = 'write-guard', storageState, proxy, ignoreHTTPSErrors })` returns `Promise<{ wsEndpoint, browser, context, guard, close() }>`. It launches Chromium with `playwright-core`, creates one context with `serviceWorkers: 'block'`, guards it with `install(context, config)` (`config` defaults to `loadConfig()`), and calls `browser.bind(title, { host, port })`; `wsEndpoint` is the `endpoint` that returns, `ws://<host>:<port>/<id>` (`port: 0` lets the OS pick a free port). `guard` is the install handle. `close()` waits for `guard.close()`, then closes the context and the browser.
+
+The three context options are passed to the one `browser.newContext({ serviceWorkers: 'block', ... })` only when they are not `undefined`:
+
+- `storageState`: a path to a Playwright storage state file, or a storage state object. The context starts with its cookies and local storage, so the agent attaches to a session that is already logged in. A path that cannot be read or parsed makes `startGuardedBrowser` reject with Playwright's message.
+- `proxy`: a Playwright proxy object, for example `{ server: 'http://proxy.example.test:3128' }`.
+- `ignoreHTTPSErrors`: a boolean; `true` accepts invalid certificates (self-signed ones, for example).
 
 A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded context as `contexts()[0]`. The guard runs in the launcher's process, so the client's own `unroute` and `unrouteAll()` cannot remove it, and a `page.route` handler that calls `continue()`, with or without overrides, is still judged (page handlers run before the owner's context route, and the request reaches the guard's catch-all with the overrides applied). New tabs the client opens in that context are guarded. A client's `page.route` handler can `fulfill` or `abort` a write, so it can mock one; that handler runs in the client's process, so the mock is not recorded as `mocked`. A client's `context.route` handler runs after the guard's catch-all, in the client's process: it receives only requests the catch-all already judged and let through, so it cannot mock a blocked write, its `continue()` or `fallback()` overrides are not judged again, and its `route.fetch()` is not seen; see "What it cannot see" below. The client cannot register its own `routeWebSocket`, because the guard already routes every WebSocket (Playwright throws `Another client is already routing WebSockets`).
 
 The command does the same from a shell:
 
 ```
-npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>]
+npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]
 ```
 
-`--config` is passed to `loadConfig` (so without it, `WRITE_GUARD_CONFIG` and `write-guard.config.json` apply), `--headed` sets `headless` to false, and `--host` and `--port` default to `127.0.0.1` and `0`. Its first output line is `config: <path>`, the file `loadConfig` read, or `config: none, using the defaults` when it read none. It then prints `endpoint: <ws endpoint>` on a line of its own, then how to attach: Playwright MCP with `--endpoint <ws endpoint>` and without `--isolated` (which uses `contexts()[0]`), or the Playwright CLI with `playwright-cli attach --endpoint=<ws endpoint>`. It stays up until SIGINT or SIGTERM, then closes the browser and exits 0. An unknown flag or a flag missing its value prints the usage line and exits 1.
+`--config` is passed to `loadConfig` (so without it, `WRITE_GUARD_CONFIG` and `write-guard.config.json` apply), `--headed` sets `headless` to false, and `--host` and `--port` default to `127.0.0.1` and `0`. `--storage-state <path>` sets `storageState` to that path, `--proxy <url>` sets `proxy` to `{ server: <url> }`, and `--ignore-https-errors` sets `ignoreHTTPSErrors` to true. A storage state file that cannot be read or parsed is a startup failure: the command prints Playwright's message and exits 1. Its first output line is `config: <path>`, the file `loadConfig` read, or `config: none, using the defaults` when it read none. It then prints `endpoint: <ws endpoint>` on a line of its own, then how to attach: Playwright MCP with `--endpoint <ws endpoint>` and without `--isolated` (which uses `contexts()[0]`), or the Playwright CLI with `playwright-cli attach --endpoint=<ws endpoint>`. It stays up until SIGINT or SIGTERM, then closes the browser and exits 0. An unknown flag or a flag missing its value prints the usage line, `usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]`, and exits 1.
 
 ## The suggest command: `playwright-write-guard-suggest`
 
@@ -371,7 +386,7 @@ and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add an anchor
 - Mocks outside the guard's process: a write that one of your own routes fulfills or aborts in the guard's process is recorded as `mocked`, but in launcher mode a client's routes run in the client's process, so their mocks are not recorded. A `fulfill` or `abort` of a request that already went through `route.fetch()` records nothing (the fetch was judged), and a GET that a route fulfills or aborts is never recorded as `suspect`. A mock is not counted in `blocked` or `observed`, so a broad stub such as `page.route('**/api/**', ...)` keeps its writes out of those counts; look at `mocked`.
 - A `request` fixture send in a `beforeAll` or `afterAll` hook: it is judged but not recorded, because no test guard exists there, so a run's record and log do not list it.
 - `writeGuardFailOnBlocked` counts only recorded blocks: it does not fail a test for a `request` fixture send refused in a `beforeAll` or `afterAll` hook, or for a leaving page's refusals, because neither is recorded. `mocked`, `suspect` and `observe` events never count either.
-- The launcher's browser and context options: it takes no storage state, proxy, `ignoreHTTPSErrors` or HTTP credentials.
+- The launcher's browser and context options: it takes storage state, a proxy and `ignoreHTTPSErrors` (`--storage-state`, `--proxy`, `--ignore-https-errors`), but no HTTP credentials and no other context option.
 - The HTTP cache: Playwright turns it off while a route is installed.
 - Service workers: `register()` resolves but `navigator.serviceWorker.ready` never settles.
 - Any context other than `contexts()[0]` in launcher mode: `--isolated`, or `browser.newContext()` from an agent's run-code tool, makes a new, unguarded context.
@@ -394,5 +409,6 @@ and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add an anchor
 - Under `read-only`, `window.SharedWorker` and `window.fetchLater` are removed in every frame: an app that checks for them falls back to a dedicated `Worker`, `fetch` or `sendBeacon`, and an app that calls them without checking does not load that part.
 - Under `read-only`, a dismissed `beforeunload` keeps the page: a test or an agent that leaves a page with unsaved changes stays on it, and a `page.goto` away from it throws `net::ERR_ABORTED` (a click on a link does not throw).
 - The console warning for a blocked request: it goes through the page's own `console.warn`, evaluated in the request's frame, so a page that replaces `console.warn` can hide the message. A request with no frame to run in, such as a worker's, gets no warning either, and the page sees only the network error.
+- The built-in click exceptions: the whole labels `Remove filter`, `Clear filters`, `Clear search` and `Remove columns` (any case, the plural of `filter` and `column` optional) are exempt from the label check even when an app makes such a click write, so the click layer does not refuse it. Only the network layer still judges what that click sends. `"defaultExceptions": false` turns the exceptions off.
 
 It is a safety net, not a security boundary. A restricted test account is the boundary.
