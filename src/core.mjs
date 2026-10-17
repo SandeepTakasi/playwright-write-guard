@@ -59,6 +59,9 @@ export function compileConfig(raw) {
     fail('log', 'must be a non-empty string or null');
   }
   if (cfg.logBodies !== undefined && typeof cfg.logBodies !== 'boolean') fail('logBodies', 'must be a boolean');
+  if (cfg.defaultExceptions !== undefined && typeof cfg.defaultExceptions !== 'boolean') {
+    fail('defaultExceptions', 'must be a boolean');
+  }
 
   const policy = oneOf(cfg.policy, ['read-only', 'observe'], 'read-only', 'policy');
   const websockets = oneOf(cfg.websockets, ['allow', 'block'], 'allow', 'websockets');
@@ -87,6 +90,9 @@ export function compileConfig(raw) {
     writes,
     text: parts.length ? new RegExp(parts.join('|'), 'i') : null,
     icons: [...icons],
+    // Whole labels only, so "Remove filter rule permanently" still matches the verbs; no save or send phrase belongs here.
+    exceptions: cfg.defaultExceptions === false ? null
+      : new RegExp('^(?:(?:remove|clear)\\s+filters?|clear\\s+search|remove\\s+columns?)$', 'i'),
     websockets,
     websocketWrites,
     suspect: suspectParts.length ? new RegExp(suspectParts.join('|'), 'i') : null,
@@ -153,8 +159,11 @@ export function decideSuspect(request, config) {
 export function decideControl(control, config) {
   const label = String(control.label ?? '').trim();
   const icon = (control.icons ?? []).find((c) => config.icons.some((p) => String(c).startsWith(p)));
-  const textHit = label !== '' && config.text !== null && config.text.test(label);
-  if (!textHit && icon === undefined) return { action: 'allow', reason: 'not a destructive control' };
+  const excepted = config.exceptions !== null && config.exceptions.test(label);
+  const textHit = label !== '' && config.text !== null && !excepted && config.text.test(label);
+  if (!textHit && icon === undefined) {
+    return { action: 'allow', reason: excepted ? `"${label}" is a built-in read-only exception` : 'not a destructive control' };
+  }
   const what = textHit ? `"${label.slice(0, 80)}" matches a destructive label` : `icon ${icon} matches a destructive icon`;
   return config.policy === 'observe'
     ? { action: 'observe', reason: `${what}; policy observe` }

@@ -198,7 +198,16 @@ for (const id of ['v-help', 'v-nav', 'v-icon', 'v-role']) {
 }
 </script>`;
 
-const PAGES = { '/trimmed': TRIMMED, '/nested': NESTED, '/first': FIRST, '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT,
+// A view-only button the built-in exceptions exempt, next to one they do not.
+const FILTER = `<!doctype html>
+<script>window.hits = [];</script>
+<button id="x-filter">Remove filter</button>
+<button id="x-rule">Remove filter rule permanently</button>
+<script>
+for (const id of ['x-filter', 'x-rule']) document.getElementById(id).addEventListener('click', () => window.hits.push(id));
+</script>`;
+
+const PAGES = { '/filter': FILTER, '/trimmed': TRIMMED, '/nested': NESTED, '/first': FIRST, '/controls': CONTROLS, '/kinds': KINDS, '/neuter': NEUTER, '/real': REAL, '/forms': FORMS, '/text': TEXT,
   '/submitters': SUBMITTERS, '/owners': OWNERS, '/blank': BLANK, '/links': LINKS, '/nav': NAV };
 
 // Real servers on 127.0.0.1, closed after each test. Request clients, route.fetch and Node's
@@ -1609,6 +1618,20 @@ test('a label that is only whitespace is skipped', async ({ context }) => {
   await page.click('#b-blank');
   await expect.poll(() => guard.record().events).toEqual([control('Delete')]);
   expect(await hits(page)).toEqual([]);
+});
+
+test('a Remove filter button is not refused in the page', async ({ context }) => {
+  await serve(context);
+  const guard = await install(context, { log: null });
+  const page = await visit(context, '/filter');
+
+  await page.click('#x-filter');
+  expect(await hits(page)).toEqual(['x-filter']);
+  expect(guard.record().blocked).toBe(0);
+
+  await page.click('#x-rule');
+  await expect.poll(() => guard.record().blocked).toBe(1);
+  expect(await hits(page)).toEqual(['x-filter']);
 });
 
 test('the trimmed label is used in the warning', async ({ context }) => {

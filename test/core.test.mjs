@@ -435,6 +435,45 @@ test('with defaultControls false and no text only icons can match', () => {
   assert.equal(decideControl(ctl('', ['icon-x']), c).action, 'block');
 });
 
+// --- built-in click exceptions -----------------------------------------------------
+
+test('built-in exceptions allow view-only labels', () => {
+  const c = cfg();
+  for (const label of ['Remove filter', 'Clear filters', 'clear search', 'Remove columns', '  Remove   filters  ']) {
+    const d = decideControl(ctl(label), c);
+    assert.equal(d.action, 'allow', label);
+    assert.equal(d.reason, `"${label.trim()}" is a built-in read-only exception`, label);
+  }
+  assert.equal(decideControl(ctl('Remove filter'), cfg({ policy: 'observe' })).action, 'allow');
+});
+
+test('an exception must match the whole label', () => {
+  const c = cfg();
+  for (const label of ['Remove filter rule permanently', 'Save search', 'Send feedback', 'Remove filter and save',
+    'Clear search and delete', 'Remove column data']) {
+    assert.equal(decideControl(ctl(label), c).action, 'block', label);
+  }
+});
+
+test('an icon match still refuses an excepted label', () => {
+  const c = cfg({ controls: { icons: ['icon-trash'] } });
+  assert.equal(decideControl(ctl('Remove filter', ['icon-trash']), c).action, 'block');
+  assert.equal(decideControl(ctl('Remove filter', ['btn']), c).action, 'allow');
+});
+
+test('defaultExceptions false turns the exceptions off', () => {
+  const c = cfg({ defaultExceptions: false });
+  assert.equal(c.exceptions, null);
+  assert.equal(decideControl(ctl('Remove filter'), c).action, 'block');
+  assert.equal(decideControl(ctl('Remove columns'), c).action, 'block');
+  assert.equal(decideControl(ctl('Clear search'), c).reason, 'not a destructive control');
+  assert.ok(cfg({ defaultExceptions: true }).exceptions instanceof RegExp);
+  assert.equal(cfg().exceptions.source, '^(?:(?:remove|clear)\\s+filters?|clear\\s+search|remove\\s+columns?)$');
+  assert.equal(cfg().exceptions.flags, 'i');
+  bad({ defaultExceptions: 'yes' }, 'defaultExceptions');
+  assert.throws(() => cfg({ defaultExceptions: 'yes' }), { message: 'write-guard: defaultExceptions: must be a boolean' });
+});
+
 // --- websocketWrites and decideFrame -------------------------------------------------
 
 test('websocketWrites defaults to an empty list and compiles one RegExp per source with no flags', () => {
@@ -627,7 +666,7 @@ test('each function behaves identically when rebuilt from its own source text', 
       assert.deepEqual(suspect2(s, c2), decideSuspect(s, c1));
     }
     for (const f of ['deleteItem 1', 'listItems', Buffer.from('deleteItem')]) assert.deepEqual(frame2(f, c2), decideFrame(f, c1));
-    for (const k of [ctl('Delete'), ctl('Open'), ctl('', ['icon-trash']), ctl('nuke it')]) {
+    for (const k of [ctl('Delete'), ctl('Open'), ctl('', ['icon-trash']), ctl('nuke it'), ctl('Remove filter'), ctl('Remove filter', ['icon-trash'])]) {
       assert.deepEqual(control2(k, c2), decideControl(k, c1));
     }
     for (const r of [req('POST', 'https://a.test/graphql', MUTATION), req('POST', 'https://a.test/graphql', QUERY),

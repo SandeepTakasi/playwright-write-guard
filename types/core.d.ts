@@ -54,6 +54,13 @@ export interface Config {
    * `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `log out`, `sign out`, `logout`.
    */
   defaultControls?: boolean;
+  /**
+   * Default `true`: a control whose whole trimmed label matches the built-in pattern
+   * `^(?:(?:remove|clear)\s+filters?|clear\s+search|remove\s+columns?)$` (case-insensitive)
+   * is not refused for its text, so view-only clicks such as "Remove filter" pass. An icon
+   * match still refuses it. There are no exceptions for `save` or `send` phrases.
+   */
+  defaultExceptions?: boolean;
   /** Default `"allow"`. */
   websockets?: 'allow' | 'block';
   /**
@@ -100,6 +107,8 @@ export interface CompiledConfig {
   text: RegExp | null;
   /** `controls.icons`; there are no built-in icons. */
   icons: string[];
+  /** The built-in click exceptions as one case-insensitive pattern tested against the whole trimmed label; `null` when `defaultExceptions` is false. */
+  exceptions: RegExp | null;
   websockets: 'allow' | 'block';
   /** `websocketWrites`, each compiled with no flags. */
   websocketWrites: RegExp[];
