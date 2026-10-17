@@ -40,7 +40,7 @@ Every key is optional, and unknown keys are ignored:
 | `writes` | list of Sig | `[]` | requests that are writes even when their method is GET, HEAD or OPTIONS, and even when an `allow` signature matches too |
 | `controls.text` | list of regex sources | `[]` | extra label patterns that make a control destructive |
 | `controls.icons` | list of class name prefixes | `[]` | a control with a class starting with one of these is destructive |
-| `defaultControls` | boolean | `true` | include the 11 built-in verbs (listed under Writes and controls) in the label pattern; `false` drops them |
+| `defaultControls` | boolean | `true` | include the 12 built-in verbs (listed under Writes and controls) in the label pattern; `false` drops them |
 | `defaultExceptions` | boolean | `true` | include the built-in read-only exception pattern (shown under Writes and controls): a control whose whole label matches it is not refused by label; `false` drops it. Any other value fails with `write-guard: defaultExceptions: must be a boolean` |
 | `websockets` | `"allow"` or `"block"` | `"allow"` | `allow` records each WebSocket open and lets it connect; `block` refuses every WebSocket |
 | `websocketWrites` | list of regex sources | `[]` | under `websockets: "allow"`, an outbound WebSocket text frame matching any of these is a write: dropped under `read-only`, recorded and forwarded under `observe`. Compiled with no flags (case-sensitive) and tested unanchored against the frame's text. Empty: frames are not judged |
@@ -77,7 +77,7 @@ So `/logout`, `/users/sign_out`, `/unsubscribe?t=1` and `/items?action=delete` a
 
 **A control is destructive** when its label matches the label pattern, or it has a class starting with one of the `controls.icons` prefixes. The label pattern is the built-in verbs (unless `defaultControls` is `false`) plus every `controls.text` source, joined into one case-insensitive regex. The built-in verbs match as whole words, case-insensitive (`Save` and `Delete item` match, `Saved` does not):
 
-`save`, `delete`, `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `log out`, `sign out`, `logout`
+`save`, `delete`, `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `refund`, `log out`, `sign out`, `logout`
 
 **Built-in exceptions.** Unless `defaultExceptions` is `false`, a short list of view-only labels is exempt from the label pattern. The exception pattern is case-insensitive and anchored at both ends, so it matches only the whole trimmed label:
 

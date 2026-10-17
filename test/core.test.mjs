@@ -61,11 +61,11 @@ test('built-in verbs match as whole words, case-insensitive', () => {
   assert.ok(!text.test('Payment history'), 'payment is not pay');
 });
 
-test('the 11 built-in verbs are present and every dropped one is absent', () => {
+test('the 12 built-in verbs are present and every dropped one is absent', () => {
   const { text } = cfg();
-  const verbs = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase',
+  const verbs = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase', 'refund',
     'log out', 'sign out', 'logout'];
-  assert.equal(verbs.length, 11);
+  assert.equal(verbs.length, 12);
   for (const v of verbs) assert.ok(text.test(v), v);
   const dropped = ['share', 'submit', 'upload', 'import', 'rename', 'duplicate', 'update', 'confirm',
     'invite', 'reset', 'restore', 'approve', 'reject'];
@@ -398,6 +398,15 @@ test('a destructive label blocks under read-only and observes under observe', ()
   assert.equal(decideControl(ctl('Delete item'), cfg()).action, 'block');
   assert.equal(decideControl(ctl('Save'), cfg()).action, 'block');
   assert.equal(decideControl(ctl('Delete item'), cfg({ policy: 'observe' })).action, 'observe');
+});
+
+test('a Refund button is refused by the built-in verbs', () => {
+  for (const label of ['Refund', 'Refund order #1050', 'Refund $86.50']) {
+    assert.equal(decideControl(ctl(label), cfg()).action, 'block', label);
+  }
+  for (const label of ['Refunded', 'Refunds']) {
+    assert.equal(decideControl(ctl(label), cfg()).action, 'allow', label);
+  }
 });
 
 test('a harmless label is allowed under every policy', () => {

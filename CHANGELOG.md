@@ -7,6 +7,7 @@ Newest first. Breaking and behaviour changes come first in each release. The gua
 ### Breaking and behaviour changes
 
 - Clicks that only change the view are no longer refused by default. A short built-in list of whole labels such as "Remove filter" and "Remove column" is let through, because they matched the built-in verb list and stalled agents on ordinary list pages. Save and send labels are never excepted, since over a socket the click layer is the only cover for them. Set `defaultExceptions: false` to turn the list off and keep the 0.5.x behaviour.
+- `refund` is a built-in destructive verb, so Refund buttons are refused by the click check (`Refunded` and `Refunds` are not, since verbs match whole words).
 
 ### New
 

@@ -50,8 +50,8 @@ export interface Config {
     icons?: string[];
   };
   /**
-   * Default `true`: include the 11 built-in verbs in the text pattern: `save`, `delete`,
-   * `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `log out`, `sign out`, `logout`.
+   * Default `true`: include the 12 built-in verbs in the text pattern: `save`, `delete`,
+   * `remove`, `publish`, `send`, `archive`, `pay`, `purchase`, `refund`, `log out`, `sign out`, `logout`.
    */
   defaultControls?: boolean;
   /**

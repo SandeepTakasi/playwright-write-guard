@@ -10,7 +10,7 @@
  * Throws `write-guard: <path>: <message>` on anything malformed.
  */
 export function compileConfig(raw) {
-  const VERBS = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase',
+  const VERBS = ['save', 'delete', 'remove', 'publish', 'send', 'archive', 'pay', 'purchase', 'refund',
     'log out', 'sign out', 'logout'];
   const SUSPECT = '(?:^|[/._-])(?:(?:log|sign)[-_]?out|unsubscribe|confirm|delete|remove)(?:$|[/._?&#-])|[?&]action=';
   const fail = (path, message) => { throw new Error(`write-guard: ${path}: ${message}`); };
