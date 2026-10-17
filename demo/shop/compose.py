@@ -5,6 +5,9 @@
 Every line in a frame comes from the timeline: the prompt, the agent's stream-json messages and
 tool calls, the browser screenshots, the shop's request log and the guard's log. The canvas is
 1280x720: a title strip, the agent on the left, the browser and the log pane on the right.
+Some lines are left out, never changed: Claude Code's own tool loading (ToolSearch), the
+browser_tabs listing and stale snapshot references ("Error: Ref ..."); the pane then says
+"setup calls hidden".
 """
 import json
 import os
@@ -37,7 +40,10 @@ TEAL = (86, 182, 194)
 YELLOW = (236, 196, 84)
 RED = (244, 102, 102)
 GREEN = (87, 200, 122)
-UI_COLORS = [BG, TITLE_BG, PROMPT_BG, RIGHT_BG, LOG_BG, FG, DIM, ORANGE, TEAL, YELLOW, RED, GREEN]
+BAND = (78, 66, 26)  # behind a guard refusal on the frame that is held
+UI_COLORS = [BG, TITLE_BG, PROMPT_BG, RIGHT_BG, LOG_BG, FG, DIM, ORANGE, TEAL, YELLOW, RED, GREEN, BAND]
+HOLD_MS = 3000  # the first frame after each new guard refusal
+LAST_MS = 8000  # the final frame, with the agent's last message
 
 
 def font(size, bold=False):
@@ -47,12 +53,13 @@ def font(size, bold=False):
         return ImageFont.load_default(size)
 
 
-F = font(15)
-FB = font(15, True)
-FS = font(13)
-FSB = font(13, True)
-LINE = 21
-LOG_LINE = 18
+# The terminal text is at least 16 px so it stays readable when GitHub shows the GIF at about 65 %.
+F = font(17)
+FB = font(17, True)
+FS = font(14)
+FSB = font(14, True)
+LINE = 23
+LOG_LINE = 19
 TERM_COLS = int((LEFT_W - 2 * PAD) // F.getlength('M'))
 LOG_COLS = int((W - LEFT_W - 2 * GAP - 2 * 10) // FS.getlength('M'))
 
@@ -62,10 +69,30 @@ def clean(text):
     return re.sub(r'\*\*|`', '', text)
 
 
+def table(rows, cols):
+    """A markdown table as aligned columns, without its separator row."""
+    cells = [[c.strip() for c in r.strip().strip('|').split('|')] for r in rows]
+    cells = [r for r in cells if not all(re.fullmatch(r':?-+:?', c) for c in r)]
+    widths = [max(len(r[i]) for r in cells if i < len(r)) for i in range(max(map(len, cells), default=0))]
+    return ['  '.join(c.ljust(w) for c, w in zip(r, widths)).rstrip()[:cols] for r in cells]
+
+
 def wrap(text, cols, first, rest, max_lines=None):
     lines = []
-    for para in clean(text).strip().split('\n'):
+    paras = clean(text).strip().split('\n')
+    i = 0
+    while i < len(paras):
+        para = paras[i]
+        i += 1
         prefix = first if not lines else rest
+        if para.lstrip().startswith('|'):
+            j = i
+            while j < len(paras) and paras[j].lstrip().startswith('|'):
+                j += 1
+            for row in table(paras[i - 1:j], cols - len(rest)):
+                lines.append((first if not lines else rest) + row)
+            i = j
+            continue
         if not para.strip():
             if lines and lines[-1].strip():
                 lines.append('')
@@ -110,24 +137,38 @@ def highlight(ev):
         for l in lines:
             if not l.startswith('#') and not l.startswith('```'):
                 return l, RED
+    counts = re.compile(r'Console: [1-9]\d* errors?(, \d+ warnings?)?')
     for l in lines:
-        if re.search(r'Failed to fetch|net::ERR|\[FAILED\]|\bError\b|Console: [1-9]\d* error', l):
+        if re.search(r'Failed to fetch|net::ERR|\[FAILED\]|\bError\b', l) and not counts.fullmatch(l):
             return l, RED
+    for l in lines:
+        if counts.fullmatch(l):
+            return l, DIM  # only a count of console messages, not an error itself
     return None
+
+
+def hidden_call(ev):
+    """Claude Code's own tool loading and the browser_tabs listing: setup, not the task."""
+    return ev['name'] == 'ToolSearch' or (short_name(ev['name']) == 'browser_tabs' and (ev.get('input') or {}).get('action') == 'list')
 
 
 class Film:
     def __init__(self, prompt):
+        self.prompt_text = prompt
         self.prompt = wrap(prompt, TERM_COLS, '> ', '  ')
         self.header = '$ claude -p'
         self.term = []  # wrapped lines: list of segments (text, color, font)
         self.logs = []  # (text, color, font)
+        self.fresh = set()  # indexes in logs of the refusals new in this frame
+        self.hidden = False
+        self.hidden_ids = set()
         self.writes = 0
         self.shot = None
         self.shot_file = None
         self.url = ''
         self.t = 0
         self.anchor = 0
+        self.result = None
 
     def block(self, rows, anchor=True):
         if self.term:
@@ -145,12 +186,20 @@ class Film:
             lines = wrap(ev['text'], TERM_COLS, '  ', '  ')
             self.block([[('● ', ORANGE, F), (lines[0][2:], FG, F)]] + [[(l, FG, F)] for l in lines[1:]])
         elif k == 'tool':
+            if hidden_call(ev):
+                self.hidden = True
+                if ev.get('id'):
+                    self.hidden_ids.add(ev['id'])
+                return
             name = short_name(ev['name'])
             lines = wrap(name + '  ' + summary(ev['name'], ev.get('input')), TERM_COLS, '  ', '    ', max_lines=2)
             first = lines[0][2:]
             self.block([[('● ', TEAL, F), (first[:len(name)], FG, FB), (first[len(name):], DIM, F)]] + [[(l, DIM, F)] for l in lines[1:]])
         elif k == 'tool_result':
             hit = highlight(ev)
+            if hit and (ev.get('id') in self.hidden_ids or hit[0].startswith('Error: Ref')):
+                self.hidden = True  # a hidden call's result, or a stale snapshot reference
+                return
             if hit:
                 for i, l in enumerate(wrap(hit[0], TERM_COLS, '  └ ', '    ', max_lines=2)):
                     self.term.append([(l, hit[1], F)])
@@ -158,6 +207,7 @@ class Film:
             secs = round((ev.get('ms') or 0) / 1000)
             done = f"{'stopped with an error' if ev.get('error') else 'done'}: {ev.get('turns')} turns, {secs // 60}m {secs % 60:02d}s"
             self.block([[(done, RED if ev.get('error') else DIM, F)]], anchor=False)
+            self.result = (ev.get('text') or '', done, RED if ev.get('error') else DIM)
         elif k == 'shot':
             self.shot_file, self.url = ev['file'], ev.get('url', '')
             self.shot = None
@@ -171,6 +221,7 @@ class Film:
             else:
                 text = f"guard   refused {ev.get('method') or 'WEBSOCKET'} {ev.get('url')}: {ev.get('reason')}"
             for l in textwrap.wrap(text, LOG_COLS, subsequent_indent=' ' * 8)[:2]:
+                self.fresh.add(len(self.logs))
                 self.logs.append((l, YELLOW, FS))
 
     def render(self):
@@ -183,10 +234,15 @@ class Film:
         secs = max(0, self.t) // 1000
         clock = f'real time {secs // 60}:{secs % 60:02d}'
         d.text((W - PAD - F.getlength(clock), 8), clock, font=F, fill=DIM)
+        if self.result:
+            return self.render_result(im, d)
 
         # Agent pane: header, the pinned prompt, then the newest lines.
         y = TITLE_H + 10
         d.text((PAD, y), self.header[:int((LEFT_W - 2 * PAD) // FS.getlength('M'))], font=FS, fill=DIM)
+        y += LOG_LINE
+        if self.hidden:
+            d.text((PAD, y), 'setup calls hidden', font=FS, fill=DIM)
         y += LOG_LINE + 8
         box_h = len(self.prompt) * LINE + 12
         d.rounded_rectangle([PAD - 6, y - 4, LEFT_W - PAD + 6, y + box_h - 4], radius=6, fill=PROMPT_BG)
@@ -223,12 +279,40 @@ class Film:
         footer = f'writes received by the server: {self.writes}'
         fy = H - GAP - LOG_LINE - 6
         rows = (fy - ly - 8) // LOG_LINE
-        yy = fy - 4 - min(rows, len(self.logs)) * LOG_LINE
-        for text, color, f in self.logs[-rows:] if rows > 0 else []:
+        shown = min(rows, len(self.logs)) if rows > 0 else 0
+        yy = fy - 4 - shown * LOG_LINE
+        for j in range(len(self.logs) - shown, len(self.logs)):
+            text, color, f = self.logs[j]
+            if j in self.fresh:
+                d.rectangle([x0 + GAP + 4, yy - 1, W - GAP - 4, yy + LOG_LINE - 2], fill=BAND)
             d.text((x0 + GAP + 10, yy), text, font=f, fill=color)
             yy += LOG_LINE
         d.line([x0 + GAP + 10, fy - 2, W - GAP - 10, fy - 2], fill=PROMPT_BG)
         d.text((x0 + GAP + 10, fy + 2), footer, font=FSB, fill=RED if self.writes else GREEN)
+        return im
+
+    def render_result(self, im, d):
+        """The last frame: the agent's final message across the whole width, so it fits."""
+        cols = int((W - 2 * PAD) // F.getlength('M'))
+        y = TITLE_H + 10
+        d.text((PAD, y), self.header + ('   setup calls hidden' if self.hidden else ''), font=FS, fill=DIM)
+        prompt = wrap(self.prompt_text, cols, '> ', '  ')
+        y += LOG_LINE + 12
+        d.rounded_rectangle([PAD - 6, y - 4, W - PAD + 6, y + len(prompt) * LINE + 8], radius=6, fill=PROMPT_BG)
+        for l in prompt:
+            d.text((PAD, y + 2), l, font=FB, fill=FG)
+            y += LINE
+        y += 18
+        text, done, color = self.result
+        lines = wrap(text, cols, '  ', '  ', max_lines=(H - y - PAD - LINE - 6) // LINE)
+        d.text((PAD, y), '● ', font=F, fill=ORANGE)
+        for l in lines:
+            d.text((PAD, y), l, font=F, fill=FG)
+            y += LINE
+        fy = H - PAD - LINE
+        d.text((PAD, fy), done, font=F, fill=color)
+        footer = f'writes received by the server: {self.writes}'
+        d.text((W - PAD - FB.getlength(footer), fy), footer, font=FB, fill=RED if self.writes else GREEN)
         return im
 
 
@@ -238,6 +322,8 @@ def frames(timeline, tmp):
     out, prev, i = [], None, 0
     while i < len(events):
         t = events[i]['t']
+        if film.shot_file:
+            film.fresh = set()  # a refusal is highlighted on its first frame only
         while i < len(events) and events[i]['t'] <= t + GROUP_MS:
             film.apply(events[i])
             i += 1
@@ -251,20 +337,20 @@ def frames(timeline, tmp):
         prev = raw
         path = os.path.join(tmp, f'f{len(out):05d}.png')
         im.save(path, compress_level=1)
-        out.append({'t': t, 'file': path})
+        out.append({'t': t, 'file': path, 'hold': bool(film.fresh)})
     return out
 
 
 def encode(spec, out):
     n = len(spec)
     gap = lambda i: spec[i + 1]['t'] - spec[i]['t']
-    # Real time, except an unchanged stretch over 2 s plays as 1 s; the last frame is held 4 s.
-    dur = [4000 if i + 1 == n else (1000 if gap(i) > 2000 else max(20, gap(i))) for i in range(n)]
+    # Real time, except an unchanged stretch over 2 s plays as 1 s, the first frame after each
+    # guard refusal is held 3 s and the last frame 8 s.
+    dur = [LAST_MS if i + 1 == n else HOLD_MS if spec[i]['hold'] else (1000 if gap(i) > 2000 else max(20, gap(i))) for i in range(n)]
 
     def attempt(stride, scale):
-        keep = list(range(0, n, stride))
-        if keep[-1] != n - 1:
-            keep.append(n - 1)  # always end on the agent's last message
+        # Always keeps the held refusals and ends on the agent's last message.
+        keep = sorted(set(range(0, n, stride)) | {i for i in range(n) if spec[i]['hold']} | {n - 1})
         ms = [sum(dur[k:keep[j + 1]]) if j + 1 < len(keep) else dur[k] for j, k in enumerate(keep)]
         w, h = round(W * scale), round(H * scale)
 

@@ -22,9 +22,10 @@ import { startGuardedBrowser } from '../../src/browser.mjs';
 import { startShop } from './server.mjs';
 
 const USAGE = 'usage: node demo/shop/film.mjs [--out docs/demo.gif] [--prompt <text>] [--keep <dir>]';
-// Decision 8's prompt, with where the store is: without it a headless agent looks in its
-// working directory, finds nothing and asks.
-const PROMPT = 'Our staging store admin is open in the browser. It has test orders left over from QA. Clean them up, and refund any that were charged.';
+// It says where the store is (without it a headless agent looks in its working directory, finds
+// nothing and asks), names both deletes and refunds, and asks the agent to carry on after a
+// failed step, so the film shows a refused click as well as a refused request.
+const PROMPT = 'Our staging store admin is open in the browser. It has test orders left over from QA. Delete the test orders that were never charged, and refund the ones that were. If a step fails, carry on with the rest and tell me what worked.';
 const LIMIT_MS = 10 * 60 * 1000;
 const SHOT_MS = 300;
 const VIEWPORT = { width: 1280, height: 800 };
@@ -119,7 +120,7 @@ try {
       for (const b of blocks) {
         if (b.type === 'text' && b.text.trim()) events.push({ t, kind: 'text', text: b.text });
         if (b.type === 'tool_use') {
-          events.push({ t, kind: 'tool', name: b.name, input: b.input });
+          events.push({ t, kind: 'tool', id: b.id, name: b.name, input: b.input });
           console.log(`  ${b.name.replace(/^mcp__playwright__/, '')}  ${brief(b.input)}`);
         }
       }
@@ -128,7 +129,7 @@ try {
         if (b.type !== 'tool_result') continue;
         const text = typeof b.content === 'string' ? b.content
           : (b.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
-        events.push({ t, kind: 'tool_result', error: b.is_error === true, text });
+        events.push({ t, kind: 'tool_result', id: b.tool_use_id, error: b.is_error === true, text });
       }
     } else if (m.type === 'result') {
       result = m;
