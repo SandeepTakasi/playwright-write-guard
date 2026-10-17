@@ -1,5 +1,5 @@
-// One-command setup for recording the README demo: the shop, a headed guarded browser that starts
-// signed in, and the commands to run next. Stop with Ctrl+C; everything it started is removed.
+// One-command setup for trying the demo by hand: the shop, a headed guarded browser that starts
+// signed in, and the commands to run next (demo/shop/film.mjs films a run). Stop with Ctrl+C; everything it started is removed.
 //
 //   node demo/shop/start.mjs
 
@@ -85,18 +85,15 @@ each from the repository root unless it says otherwise:
 2. Log pane, in a terminal beside Claude Code:
    node demo/shop/log.mjs ${shop.requestLog} ${files.guardLog}
 
-3. Recorder, in a third terminal. Start it last, just before you paste the prompt:
-   node demo/shop/record.mjs
-
-4. Claude Code, in an empty directory (Playwright MCP writes a .playwright-mcp folder into its
+3. Claude Code, in an empty directory (Playwright MCP writes a .playwright-mcp folder into its
    working directory):
    cd ${work}
    claude --mcp-config ${files.mcp}
 
-5. Paste this prompt into Claude Code:
+4. Paste this prompt into Claude Code:
    ${PROMPT}
 
-When the agent has finished, stop the recorder with Ctrl+C. Stop this script with Ctrl+C too.
+Stop this script with Ctrl+C when you are done. To film a run instead, use node demo/shop/film.mjs.
 `);
 } catch (err) {
   console.error(err?.message ?? String(err));
