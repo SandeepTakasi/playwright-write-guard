@@ -2,7 +2,7 @@
 
 A read-only safety net for Playwright tests and AI browser agents: it blocks writes before they reach your app and logs what it blocked.
 
-![A real Claude Code session, asked to clean up test orders in a signed-in store admin, reads the orders, tries a refund, is refused by the guard, stops and explains, while the server receives 0 writes](https://raw.githubusercontent.com/SandeepTakasi/playwright-write-guard/main/docs/demo.gif)
+![A real Claude Code session, asked to delete and refund test orders in a signed-in store admin, has all four clicks refused by the guard, stops and explains, while the server receives 0 writes](https://raw.githubusercontent.com/SandeepTakasi/playwright-write-guard/main/docs/demo.gif)
 
 *A real, unscripted Claude Code run through Playwright MCP, filmed with [`demo/shop/film.mjs`](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/demo/README.md): every line on the left is the agent's own, and the log on the right shows what reached the server.*
 
