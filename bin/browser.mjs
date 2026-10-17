@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { startGuardedBrowser } from '../src/browser.mjs';
 import { loadConfig } from '../src/install.mjs';
 
-const USAGE = 'usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]';
+const USAGE = 'usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors] [--print-mcp-config]';
 
 let args;
 try {
@@ -18,6 +18,7 @@ try {
       'storage-state': { type: 'string' },
       proxy: { type: 'string' },
       'ignore-https-errors': { type: 'boolean' },
+      'print-mcp-config': { type: 'boolean' },
     },
   }));
 } catch {
@@ -49,6 +50,12 @@ const ws = guarded.wsEndpoint;
 const file = guarded.guard.record().config_file;
 console.log(file === null ? 'config: none, using the defaults' : `config: ${file}`);
 console.log(`endpoint: ${ws}`);
+if (args['print-mcp-config']) {
+  // The version the docs say both attach modes were checked with.
+  const mcp = { mcpServers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@0.0.83', '--endpoint', ws] } } };
+  console.log("MCP config (paste into your client's MCP settings):");
+  console.log(JSON.stringify(mcp, null, 2));
+}
 console.log('Attach one of:');
 console.log(`  Playwright MCP: --endpoint ${ws} (without --isolated, which would make a new, unguarded context)`);
 console.log(`  Playwright CLI: playwright-cli attach --endpoint=${ws}`);

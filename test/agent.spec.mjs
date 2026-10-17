@@ -327,6 +327,36 @@ async function listen(handler, scheme = 'http', tls = {}) {
 const stopServer = (server) => new Promise((done) => { server.close(done); server.closeAllConnections(); });
 
 test.describe('the command', () => {
+  test('--print-mcp-config prints a config for the endpoint', async ({}, testInfo) => {
+    const run = await runCommand(['--port', '0', '--print-mcp-config'], testInfo);
+    try {
+      const out = run.stdout();
+      const heading = "MCP config (paste into your client's MCP settings):\n";
+      expect(out.indexOf(heading)).toBeGreaterThan(out.indexOf('endpoint: '));
+      const json = out.slice(out.indexOf(heading) + heading.length, out.indexOf('Attach one of:'));
+      const config = JSON.parse(json);
+      expect(config.mcpServers.playwright.command).toBe('npx');
+      const args = config.mcpServers.playwright.args;
+      expect(args.slice(0, 2)).toEqual(['-y', '@playwright/mcp@0.0.83']);
+      expect(args[args.indexOf('--endpoint') + 1]).toBe(run.endpoint);
+      expect(json.trim()).toBe(JSON.stringify(config, null, 2));
+    } finally {
+      run.child.kill('SIGTERM');
+    }
+    expect(await run.exited).toEqual({ code: 0, signal: null });
+  });
+
+  test('without --print-mcp-config the output has no MCP config', async ({}, testInfo) => {
+    const run = await runCommand(['--port', '0'], testInfo);
+    try {
+      expect(run.stdout()).not.toContain('MCP config');
+      expect(run.stdout()).not.toContain('mcpServers');
+    } finally {
+      run.child.kill('SIGTERM');
+    }
+    expect(await run.exited).toEqual({ code: 0, signal: null });
+  });
+
   test('the command prints which config it loaded', async ({}, testInfo) => {
     const named = await runCommand(['--port', '0'], testInfo);
     try {
@@ -472,7 +502,7 @@ test.describe('the command', () => {
 
   test('the usage line names the launch flags', () => {
     const r = spawnSync(process.execPath, [BIN, '--nope'], { encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL' });
-    expect(r.stderr.trim()).toBe('usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]');
+    expect(r.stderr.trim()).toBe('usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors] [--print-mcp-config]');
   });
 
   test('the launcher starts logged in with --storage-state', async ({}, testInfo) => {
