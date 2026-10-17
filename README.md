@@ -19,10 +19,10 @@ npx playwright-write-guard-browser --storage-state state.json
 The launcher prints `endpoint: ws://...`. Point Playwright MCP at that endpoint with `--endpoint` (and without `--isolated`), then ask the agent to look around:
 
 ```
-npx @playwright/mcp --endpoint ws://127.0.0.1:<port>/<id>
+npx @playwright/mcp@0.0.83 --endpoint ws://127.0.0.1:<port>/<id>
 ```
 
-`state.json` is a saved login (see [logging in](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#logging-in)). Drop `--storage-state` if the app needs no login.
+`--print-mcp-config` also prints the JSON to paste into an MCP client's settings. `state.json` is a saved login (see [logging in](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#logging-in)); drop `--storage-state` if the app needs no login.
 
 **Playwright Test:**
 
@@ -54,14 +54,14 @@ This package puts a read-only guard in front of the browser:
 What it guarantees, and what it does not:
 
 - **Enforced:** every HTTP request the pages of a guarded context send is judged at the network layer, whatever triggered it, with the exceptions below. This is the main layer: a "Continue" button that submits a payment still sends a request, and that request is judged. WebSockets are the first exception: by default a socket opens and each open is recorded as a `websocket` event, but its messages, writes included, are not judged or logged. List patterns in `websocketWrites` to judge the text frames the page sends (see [WebSocket frames](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#websocket-frames-and-suspect-gets)); `websockets: "block"` refuses the sockets the guard routes, and apps that need a socket then do not load. The others are sends from a page that is being left, HTTP from a `SharedWorker` and requests made with `fetchLater`, which Playwright does not route (next item).
-- **Leaving pages, shared workers and `fetchLater`:** Playwright does not route a request a page starts while it is being left, nor the HTTP of a `SharedWorker`, nor a `fetchLater` request. Under `read-only` the page script judges the writes of a leaving page itself and removes `window.SharedWorker` and `window.fetchLater`; under `observe` none of them is judged or recorded. The details are in the [guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#leaving-pages-shared-workers-and-fetchlater).
+- **Leaving pages, shared workers and `fetchLater`:** Playwright does not route a request a page starts while being left, the HTTP of a `SharedWorker`, or a `fetchLater` request. Under `read-only` the page script judges a leaving page's writes itself and removes `window.SharedWorker` and `window.fetchLater`; under `observe` none of them is judged or recorded. The details are in the [guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#leaving-pages-shared-workers-and-fetchlater).
 - **Heuristic:** which requests count as writes, and which controls count as destructive.
   - Requests are judged by method, unless your `allow` and `writes` signatures say otherwise. Apps that read over POST (GraphQL, search APIs, server actions, long polling) stop working until those endpoints are allow-listed. A run under `observe` lists them (method, URL, content type and header names; set `logBodies: true` to add the first 500 characters of each body, which can hold credentials, so it is off by default), and [a command drafts the allow entries from that log](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#writing-an-allow-list). Events carry header names, never values, so reads told apart only by a header value have to be found in the app's own code or network panel. GETs with side effects (logout, unsubscribe, `?action=delete`) pass, but a GET whose path or query matches a short built-in pattern is recorded as a `suspect` event; it is never blocked. Other side-effecting GETs pass with no event unless a `writes` signature names them.
   - Controls are judged by label, and only real controls: buttons, links with an `href`, elements with a button, menuitem, link or tab role, and submit, button or image inputs. A link that navigates is judged by its URL instead of its label. The click check is a second layer that stops the app before it starts a write. Its built-in verb list is short (save, delete, remove, publish, send, archive, pay, purchase, log out, sign out, logout): it still refuses some harmless controls such as "Save search", and misses writing controls such as "Place order" or "Add to cart". A short built-in list of view-only labels (`Remove filter`, `Clear filters`, `Clear search`, `Remove columns`, whole labels only) is exempt; `defaultExceptions: false` turns it off. If the check still gets in the way, set `defaultControls: false` and name your app's own verbs in `controls.text`.
 - **Not covered:** anything outside the guarded context, such as other contexts, request clients the guard cannot reach, and code that removes the guard. See [What it cannot see](#what-it-cannot-see). The boundary is a restricted account: give the run credentials that cannot write, and use the guard to catch mistakes before they reach it.
 - **Cost:** Playwright turns off the HTTP cache while a route is installed, so every load fetches every asset again. Service workers are blocked, so an app that waits for `navigator.serviceWorker.ready` hangs. Every WebSocket a page opens goes through Playwright's routing, which makes socket traffic noticeably slower.
 
-See it work end to end, with a local page and a local server, in the walkthrough at [demo/README.md](demo/README.md) (`node demo/run.mjs`).
+See it work end to end, with a local page and server, in the walkthrough at [demo/README.md](demo/README.md) (`node demo/run.mjs`).
 
 ## Install
 
@@ -140,7 +140,7 @@ The sections on [logging in](https://github.com/SandeepTakasi/playwright-write-g
 
 Pick one mode for a given browser. Using both at once is refused: the second guard throws `write-guard: this context is already guarded by another process; use one mode, not both`, and Playwright MCP then fails every tool call with that message.
 
-Config mode depends on denying the agent its code-running and routing tools; the example below is for Claude Code. If your agent cannot deny tools that way, use launcher mode. Both modes were checked with Playwright MCP 0.0.83 driving the demo app: the agent's Delete click was refused in the page, its `fetch` DELETE was blocked at the network, and the server received no writes. The agent sees a refused click only as a warning count in the click's result: the reason is in the console messages (Playwright MCP's `browser_console_messages`). A blocked request other than a navigation reports `Failed to fetch` and, under `read-only`, also leaves a `write-guard refused <METHOD> <URL>: <reason>` warning in the console messages of its frame.
+Config mode depends on denying the agent its code-running and routing tools (the example below is for Claude Code); if your agent cannot, use launcher mode. Both modes were checked with Playwright MCP 0.0.83 driving the demo app: the agent's Delete click was refused in the page, its `fetch` DELETE was blocked at the network, and the server received no writes. The agent sees a refused click only as a warning count in the click's result; the reason is in the console messages (`browser_console_messages`). A blocked request other than a navigation reports `Failed to fetch` and, under `read-only`, also leaves a `write-guard refused <METHOD> <URL>: <reason>` warning in the console messages of its frame.
 
 ### Config mode: the `initPage` entry
 
@@ -181,7 +181,7 @@ Without those entries the agent can remove the guard.
 The launcher starts Chromium, guards its one context, and prints a WebSocket endpoint:
 
 ```
-npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]
+npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors] [--print-mcp-config]
 ```
 
 `--storage-state` starts the browser logged in from a saved session file, `--proxy` sends its traffic through a proxy, and `--ignore-https-errors` accepts self-signed certificates (see [logging in](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#logging-in)). It prints `config: <path>` (or `config: none, using the defaults`) as its first line, then `endpoint: <ws endpoint>`. Attach the agent to it:
@@ -209,6 +209,7 @@ The [full list of limits](https://github.com/SandeepTakasi/playwright-write-guar
 
 - [API reference](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/api.md): every entry point, the config keys, the decision rules, the installer, the fixture, the launcher, the suggest command, and the same list of limits.
 - [Guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md): logging in, WebSocket frames and suspect GETs, the audit log, and writing an allow list.
+- [Changelog](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/CHANGELOG.md): what changed in each release.
 
 ## License
 

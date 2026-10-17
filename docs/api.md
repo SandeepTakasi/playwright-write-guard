@@ -326,10 +326,25 @@ A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded conte
 The command does the same from a shell:
 
 ```
-npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]
+npx playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors] [--print-mcp-config]
 ```
 
-`--config` is passed to `loadConfig` (so without it, `WRITE_GUARD_CONFIG` and `write-guard.config.json` apply), `--headed` sets `headless` to false, and `--host` and `--port` default to `127.0.0.1` and `0`. `--storage-state <path>` sets `storageState` to that path, `--proxy <url>` sets `proxy` to `{ server: <url> }`, and `--ignore-https-errors` sets `ignoreHTTPSErrors` to true. A storage state file that cannot be read or parsed is a startup failure: the command prints Playwright's message and exits 1. Its first output line is `config: <path>`, the file `loadConfig` read, or `config: none, using the defaults` when it read none. It then prints `endpoint: <ws endpoint>` on a line of its own, then how to attach: Playwright MCP with `--endpoint <ws endpoint>` and without `--isolated` (which uses `contexts()[0]`), or the Playwright CLI with `playwright-cli attach --endpoint=<ws endpoint>`. It stays up until SIGINT or SIGTERM, then closes the browser and exits 0. An unknown flag or a flag missing its value prints the usage line, `usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors]`, and exits 1.
+`--config` is passed to `loadConfig` (so without it, `WRITE_GUARD_CONFIG` and `write-guard.config.json` apply), `--headed` sets `headless` to false, and `--host` and `--port` default to `127.0.0.1` and `0`. `--storage-state <path>` sets `storageState` to that path, `--proxy <url>` sets `proxy` to `{ server: <url> }`, and `--ignore-https-errors` sets `ignoreHTTPSErrors` to true. A storage state file that cannot be read or parsed is a startup failure: the command prints Playwright's message and exits 1. Its first output line is `config: <path>`, the file `loadConfig` read, or `config: none, using the defaults` when it read none. It then prints `endpoint: <ws endpoint>` on a line of its own, then how to attach: Playwright MCP with `--endpoint <ws endpoint>` and without `--isolated` (which uses `contexts()[0]`), or the Playwright CLI with `playwright-cli attach --endpoint=<ws endpoint>`. It stays up until SIGINT or SIGTERM, then closes the browser and exits 0. An unknown flag or a flag missing its value prints the usage line, `usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors] [--print-mcp-config]`, and exits 1.
+
+`--print-mcp-config` makes the command print a ready-made MCP client config after the `endpoint:` line: the line `MCP config (paste into your client's MCP settings):`, then this JSON with two-space indentation, where `<ws endpoint>` is the endpoint printed above:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@0.0.83", "--endpoint", "<ws endpoint>"]
+    }
+  }
+}
+```
+
+`@playwright/mcp@0.0.83` is the version the guard was checked with. Without the flag the output is unchanged.
 
 ## The suggest command: `playwright-write-guard-suggest`
 
