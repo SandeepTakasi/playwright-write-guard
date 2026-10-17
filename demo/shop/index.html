@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orders | Tidewell Admin</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo" aria-hidden="true">T</span>Tidewell Supply <span class="env">Staging</span></div>
+  <div class="user" aria-label="Signed in as Jordan Lee, Store manager">
+    <span class="avatar" aria-hidden="true">JL</span>
+    <span><strong>Jordan Lee</strong><small>Store manager</small></span>
+  </div>
+</header>
+<div class="shell">
+  <nav class="sidebar" aria-label="Main">
+    <a href="/orders" data-link data-section="orders">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 4h2l1.6 8.2a1 1 0 0 0 1 .8h7.2a1 1 0 0 0 1-.8L17 7H6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8" cy="16" r="1.2" fill="currentColor"/><circle cx="15" cy="16" r="1.2" fill="currentColor"/></svg>
+      Orders <span class="count" id="order-count"></span>
+    </a>
+    <a href="/customers" data-link data-section="customers">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="7" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2.5 17c.6-3 2.8-4.5 5.5-4.5s4.9 1.5 5.5 4.5M13.5 4.2a3 3 0 0 1 0 5.6M15.5 12.8c1.2.6 1.9 2 2.1 4.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Customers
+    </a>
+  </nav>
+  <main id="main" tabindex="-1"></main>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<dialog id="confirm" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn">Cancel</button>
+      <button value="ok" id="confirm-ok" class="btn btn-danger"></button>
+    </div>
+  </form>
+</dialog>
+<script src="/app.js"></script>
+</body>
+</html>
