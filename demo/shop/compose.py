@@ -5,7 +5,7 @@
 Every line in a frame comes from the timeline: the prompt, the agent's stream-json messages and
 tool calls, the browser screenshots, the shop's request log and the guard's log. The canvas is
 1280x720: a title strip, the agent on the left, the browser and the log pane on the right.
-Some lines are left out, never changed: Claude Code's own tool loading (ToolSearch), the
+An em or en dash in shown text is drawn as a comma. Some lines are left out, never changed: Claude Code's own tool loading (ToolSearch), the
 browser_tabs listing and stale snapshot references ("Error: Ref ..."); the pane then says
 "setup calls hidden".
 """
@@ -64,9 +64,15 @@ TERM_COLS = int((LEFT_W - 2 * PAD) // F.getlength('M'))
 LOG_COLS = int((W - LEFT_W - 2 * GAP - 2 * 10) // FS.getlength('M'))
 
 
+def commas(text):
+    """Shows an em or en dash as a comma (punctuation only, the words are unchanged)."""
+    text = re.sub(r'[ \t]*[\N{EN DASH}\N{EM DASH}][ \t]*', ', ', text)
+    return re.sub(r'(?m)^, ', '', text)  # a dash that opened a line
+
+
 def clean(text):
-    # Markdown markers only; the words are the agent's own.
-    return re.sub(r'\*\*|`', '', text)
+    # Markdown markers and dashes only; the words are the agent's own.
+    return commas(re.sub(r'\*\*|`', '', text))
 
 
 def table(rows, cols):
@@ -220,7 +226,7 @@ class Film:
                 text = f'guard   refused "{ev.get("label", "")}"'
             else:
                 text = f"guard   refused {ev.get('method') or 'WEBSOCKET'} {ev.get('url')}: {ev.get('reason')}"
-            for l in textwrap.wrap(text, LOG_COLS, subsequent_indent=' ' * 8)[:2]:
+            for l in textwrap.wrap(commas(text), LOG_COLS, subsequent_indent=' ' * 8)[:2]:
                 self.fresh.add(len(self.logs))
                 self.logs.append((l, YELLOW, FS))
 

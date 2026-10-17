@@ -1,6 +1,6 @@
 // Films a real Claude Code run against the store admin, with no windows, keys or OS permissions:
 // the shop, a headless guarded browser that starts signed in, Playwright MCP attached to it, and
-// `claude -p` with the prompt. Everything the film shows is recorded while the agent works (its
+// `claude -p` with the prompt and no built-in tools, only Playwright MCP's. Everything the film shows is recorded while the agent works (its
 // stream-json output, browser screenshots, the shop's request log and the guard's log) and then
 // composed into a GIF by compose.py (Python 3 with Pillow; PYTHON overrides the interpreter).
 //
@@ -100,7 +100,9 @@ try {
 
   const start = Date.now();
   console.log(`Filming. The agent has up to ${LIMIT_MS / 60000} minutes; its tool calls are listed as they happen.`);
-  claude = spawn('claude', ['-p', prompt, '--mcp-config', mcpConfig, '--strict-mcp-config', '--allowedTools', 'mcp__playwright',
+  // `--tools ''` removes every built-in tool (Bash, Read and the rest), so the agent has only
+  // Playwright MCP's; `--allowedTools` then pre-approves those so no prompt is needed.
+  claude = spawn('claude', ['-p', prompt, '--mcp-config', mcpConfig, '--strict-mcp-config', '--tools', '', '--allowedTools', 'mcp__playwright',
     '--output-format', 'stream-json', '--verbose'], {
     cwd: work,
     detached: true,
