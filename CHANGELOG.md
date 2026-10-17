@@ -2,7 +2,7 @@
 
 Newest first. Breaking and behaviour changes come first in each release. The guard is a safety net, not a security boundary; the README lists what it cannot see.
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-10-17)
 
 ### Breaking and behaviour changes
 
@@ -21,7 +21,7 @@ Newest first. Breaking and behaviour changes come first in each release. The gua
 
 - The README now opens with a short pitch, a demo and a quickstart, shows the five limits that matter most in a table, and links to the full list of limits in `docs/limits.md`.
 - The quickstart pins the Playwright MCP version it was checked with and mentions `--print-mcp-config`.
-- The demo shows a real Claude Code session asked to clean up test orders in a signed-in store admin app: it is refused on a refund, stops and explains, and the server receives no write.
+- The demo shows a real Claude Code session, limited to the browser tools, asked to delete and refund test orders in a signed-in store admin app: all four clicks are refused, it stops and explains, and the server receives no write.
 - The `demo/` folder holds the store admin app, a one-command setup and the script that films a run.
 - This changelog.
 
