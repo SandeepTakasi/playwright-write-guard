@@ -79,20 +79,22 @@ test('a guarded agent can read orders but no write reaches the store', async () 
     await page.getByRole('button', { name: 'Delete selected' }).click();
     await expect(page.getByRole('dialog')).toBeHidden();
 
-    // Refund is not a destructive label, so the dialog opens; its POST is blocked instead.
+    // Refund is a built-in destructive verb, so its click is refused too and no dialog opens.
     await page.getByRole('button', { name: 'Refund order #1045' }).click();
-    await page.getByRole('dialog').getByRole('button', { name: /^Refund/ }).click();
-    await expect(page.getByRole('status')).toContainText('Could not refund order #1045');
+    await expect(page.getByRole('dialog')).toBeHidden();
 
-    const status = await page.evaluate(() => fetch('/api/orders/1045', { method: 'DELETE' }).then((r) => r.status, () => 'failed'));
-    expect(status).toBe('failed');
+    // The network layer still covers refunds and deletes sent without a click.
+    const send = (path, method) => page.evaluate(([p, m]) => fetch(p, { method: m }).then((r) => r.status, () => 'failed'), [path, method]);
+    expect(await send('/api/orders/1045/refund', 'POST')).toBe('failed');
+    expect(await send('/api/orders/1045', 'DELETE')).toBe('failed');
 
     await page.goto(`${shop.url}/orders/1045`);
     await expect(page.getByRole('heading', { name: /#1045/ })).toBeVisible();
 
     const events = g.guard.record().events.filter((e) => e.action === 'block');
     expect(events.map((e) => (e.kind === 'control' ? `click ${e.label}` : `${e.method} ${new URL(e.url).pathname}`))).toEqual([
-      'click Delete order #1047', 'click Delete selected', 'POST /api/orders/1045/refund', 'DELETE /api/orders/1045',
+      'click Delete order #1047', 'click Delete selected', 'click Refund order #1045',
+      'POST /api/orders/1045/refund', 'DELETE /api/orders/1045',
     ]);
     expect(requests(shop).some((r) => r.path === '/api/orders/1045')).toBe(true);
     expect(writes(shop)).toEqual([]);
