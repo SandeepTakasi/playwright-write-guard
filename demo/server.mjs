@@ -1,8 +1,18 @@
-// Tiny dependency-free demo app: a list of items you can add and delete.
+// Tiny dependency-free demo app: a list of items you can add and delete, behind a session.
+// The server never sets the cookie itself: send `session=demo` (a storage-state file does it).
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 
 const indexUrl = new URL('./index.html', import.meta.url);
+// A Playwright storage state that signs in to the demo server on 127.0.0.1.
+export const demoStorageState = {
+  cookies: [{ name: 'session', value: 'demo', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }],
+  origins: [],
+};
+const SIGN_IN = `<!doctype html><html lang="en"><meta charset="utf-8"><title>Sign in</title>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem">
+<h1>Sign in</h1><p>You are not signed in. This demo has no sign-in form: send the cookie
+<code>session=demo</code>, for example from a storage-state file.</p></body></html>`;
 
 export function startDemoServer({ port = 0 } = {}) {
   const items = [
@@ -22,11 +32,15 @@ export function startDemoServer({ port = 0 } = {}) {
     try {
       const path = new URL(req.url, 'http://127.0.0.1').pathname;
       if (req.method !== 'GET') writes++;
+      const signedIn = /(?:^|;\s*)session=demo(?:;|$)/.test(req.headers.cookie ?? '');
 
       if (req.method === 'GET' && path === '/') {
-        return send(res, 200, await readFile(indexUrl, 'utf8'), 'text/html; charset=utf-8');
+        const html = signedIn ? await readFile(indexUrl, 'utf8') : SIGN_IN;
+        return send(res, 200, html, 'text/html; charset=utf-8');
       }
+      if (!signedIn) return send(res, 401, { error: 'sign in first' });
       if (req.method === 'GET' && path === '/api/items') return send(res, 200, items);
+      if (req.method === 'GET' && path === '/api/stats') return send(res, 200, { writes });
 
       if (req.method === 'POST' && path === '/api/items') {
         let raw = '';

@@ -5,10 +5,11 @@
 
 import { chromium } from 'playwright-core';
 import { startGuardedBrowser } from '../src/browser.mjs';
-import { startDemoServer } from './server.mjs';
+import { startDemoServer, demoStorageState } from './server.mjs';
 
 const server = await startDemoServer();
-const guarded = await startGuardedBrowser({ config: { log: null } });
+// Start signed in: the storage state carries the demo's session cookie.
+const guarded = await startGuardedBrowser({ config: { log: null }, storageState: demoStorageState });
 let client;
 let writes = -1;
 let blocked = 0;

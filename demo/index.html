@@ -8,11 +8,13 @@
   body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; }
   li { display: flex; justify-content: space-between; align-items: center; padding: .25rem 0; }
   #status { color: #a00; min-height: 1.5em; }
+  #writes { margin-top: 1.5rem; padding: .5rem .75rem; background: #eef6ee; border-radius: .25rem; }
 </style>
 </head>
 <body>
 <main>
   <h1>Items</h1>
+  <p>Signed in as demo</p>
   <ul id="items" aria-label="Items"></ul>
   <form id="add">
     <label for="name">New item name</label>
@@ -20,10 +22,20 @@
     <button type="submit">Add item</button>
   </form>
   <p id="status" role="status"></p>
+  <p id="writes">Writes received by the server: <strong id="write-count">?</strong></p>
 </main>
 <script>
 const list = document.getElementById('items');
 const status = document.getElementById('status');
+
+// The server's own count of non-GET requests, polled so a refused click (which no app handler
+// sees) still shows here.
+async function refreshWrites() {
+  const res = await fetch('/api/stats').catch(() => null);
+  if (res?.ok) document.getElementById('write-count').textContent = (await res.json()).writes;
+}
+refreshWrites();
+setInterval(refreshWrites, 500);
 
 async function call(url, options) {
   try {
