@@ -2,6 +2,18 @@
 
 Newest first. Breaking and behaviour changes come first in each release. The guard is a safety net, not a security boundary; the README lists what it cannot see.
 
+## 0.6.1 (2026-10-18)
+
+### New
+
+- `PLAYWRIGHT_MCP_VERSION` is exported from `playwright-write-guard/browser`: the Playwright MCP version the launcher's printed config pins and the guard was checked with.
+- The daily CI workflow also runs a real Playwright MCP, at its latest release, against the guarded launcher and expects a Delete click refused with no write.
+
+### Docs
+
+- The quickstart shows how to save a login for `--storage-state` (`npx playwright codegen --save-storage=state.json ...`).
+- The README's overview is one short section of bullets that link to the guide, the reference and the limits.
+
 ## 0.6.0 (2026-10-17)
 
 ### Breaking and behaviour changes
