@@ -34,4 +34,7 @@ export interface GuardedBrowser {
   close(): Promise<void>;
 }
 
+/** The Playwright MCP version the launcher's printed config and the demos pin; the version the guard was checked with. */
+export const PLAYWRIGHT_MCP_VERSION: string;
+
 export function startGuardedBrowser(options?: GuardedBrowserOptions): Promise<GuardedBrowser>;

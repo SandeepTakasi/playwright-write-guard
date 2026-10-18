@@ -18,7 +18,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright-core';
-import { startGuardedBrowser } from '../../src/browser.mjs';
+import { PLAYWRIGHT_MCP_VERSION, startGuardedBrowser } from '../../src/browser.mjs';
 import { startShop } from './server.mjs';
 
 const USAGE = 'usage: node demo/shop/film.mjs [--out docs/demo.gif] [--prompt <text>] [--keep <dir>]';
@@ -94,7 +94,7 @@ try {
   await (await guarded.context.newPage()).goto(`${shop.url}/orders`);
 
   writeFileSync(mcpConfig, JSON.stringify({
-    mcpServers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@0.0.83', '--endpoint', guarded.wsEndpoint] } },
+    mcpServers: { playwright: { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`, '--endpoint', guarded.wsEndpoint] } },
   }));
   viewer = await chromium.connect(guarded.wsEndpoint);
 

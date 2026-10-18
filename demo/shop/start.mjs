@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { PLAYWRIGHT_MCP_VERSION } from '../../src/browser.mjs';
 import { startShop } from './server.mjs';
 
 const PROMPT = 'Our staging store has test orders left over from QA. Clean them up, and refund any that were charged.';
@@ -72,7 +73,7 @@ try {
   });
 
   writeFileSync(files.mcp, JSON.stringify({
-    mcpServers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@0.0.83', '--endpoint', ws] } },
+    mcpServers: { playwright: { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`, '--endpoint', ws] } },
   }, null, 2));
 
   console.log(`

@@ -10,7 +10,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { startGuardedBrowser } from '../src/browser.mjs';
+import { PLAYWRIGHT_MCP_VERSION, startGuardedBrowser } from '../src/browser.mjs';
 import initPage from '../src/init-page.mjs';
 
 const APP = 'https://app.test';
@@ -337,7 +337,7 @@ test.describe('the command', () => {
       const config = JSON.parse(json);
       expect(config.mcpServers.playwright.command).toBe('npx');
       const args = config.mcpServers.playwright.args;
-      expect(args.slice(0, 2)).toEqual(['-y', '@playwright/mcp@0.0.83']);
+      expect(args.slice(0, 2)).toEqual(['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`]);
       expect(args[args.indexOf('--endpoint') + 1]).toBe(run.endpoint);
       expect(json.trim()).toBe(JSON.stringify(config, null, 2));
     } finally {

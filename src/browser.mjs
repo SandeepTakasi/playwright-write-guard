@@ -5,6 +5,9 @@
 import { chromium } from 'playwright-core';
 import { install, loadConfig } from './install.mjs';
 
+// The Playwright MCP version the printed config and the demos pin: the one the guard was checked with.
+export const PLAYWRIGHT_MCP_VERSION = '0.0.83';
+
 export async function startGuardedBrowser({ config = loadConfig(), headless = true, host = '127.0.0.1', port = 0, title = 'write-guard', storageState, proxy, ignoreHTTPSErrors } = {}) {
   const browser = await chromium.launch({ headless });
   try {

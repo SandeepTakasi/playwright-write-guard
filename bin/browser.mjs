@@ -2,7 +2,7 @@
 // playwright-write-guard-browser: start a guarded Chromium and print how an agent attaches.
 
 import { parseArgs } from 'node:util';
-import { startGuardedBrowser } from '../src/browser.mjs';
+import { PLAYWRIGHT_MCP_VERSION, startGuardedBrowser } from '../src/browser.mjs';
 import { loadConfig } from '../src/install.mjs';
 
 const USAGE = 'usage: playwright-write-guard-browser [--config <path>] [--headed] [--host <h>] [--port <n>] [--storage-state <path>] [--proxy <url>] [--ignore-https-errors] [--print-mcp-config]';
@@ -52,7 +52,7 @@ console.log(file === null ? 'config: none, using the defaults' : `config: ${file
 console.log(`endpoint: ${ws}`);
 if (args['print-mcp-config']) {
   // The version the docs say both attach modes were checked with.
-  const mcp = { mcpServers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@0.0.83', '--endpoint', ws] } } };
+  const mcp = { mcpServers: { playwright: { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`, '--endpoint', ws] } } };
   console.log("MCP config (paste into your client's MCP settings):");
   console.log(JSON.stringify(mcp, null, 2));
 }

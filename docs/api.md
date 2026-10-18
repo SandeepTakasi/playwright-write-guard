@@ -321,6 +321,8 @@ The three context options are passed to the one `browser.newContext({ serviceWor
 - `proxy`: a Playwright proxy object, for example `{ server: 'http://proxy.example.test:3128' }`.
 - `ignoreHTTPSErrors`: a boolean; `true` accepts invalid certificates (self-signed ones, for example).
 
+The module also exports `PLAYWRIGHT_MCP_VERSION`, a string (`'0.0.83'`): the Playwright MCP version the launcher command's printed config and the demos pin, and the version the guard was checked with. The docs name the same version, and a unit test fails when they do not.
+
 A client attaches with `chromium.connect(wsEndpoint)` and sees the guarded context as `contexts()[0]`. The guard runs in the launcher's process, so the client's own `unroute` and `unrouteAll()` cannot remove it, and a `page.route` handler that calls `continue()`, with or without overrides, is still judged (page handlers run before the owner's context route, and the request reaches the guard's catch-all with the overrides applied). New tabs the client opens in that context are guarded. A client's `page.route` handler can `fulfill` or `abort` a write, so it can mock one; that handler runs in the client's process, so the mock is not recorded as `mocked`. A client's `context.route` handler runs after the guard's catch-all, in the client's process: it receives only requests the catch-all already judged and let through, so it cannot mock a blocked write, its `continue()` or `fallback()` overrides are not judged again, and its `route.fetch()` is not seen; see "What it cannot see" below. The client cannot register its own `routeWebSocket`, because the guard already routes every WebSocket (Playwright throws `Another client is already routing WebSockets`).
 
 The command does the same from a shell:
