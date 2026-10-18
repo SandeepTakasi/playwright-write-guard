@@ -21,6 +21,7 @@ Every key is optional, and unknown keys are ignored:
   "policy": "read-only",
   "allow": [],
   "writes": [],
+  "graphql": [],
   "controls": { "text": [], "icons": [] },
   "defaultControls": true,
   "defaultExceptions": true,
@@ -38,6 +39,7 @@ Every key is optional, and unknown keys are ignored:
 | `policy` | `"read-only"` or `"observe"` | `"read-only"` | `read-only` blocks writes and destructive controls; `observe` records them and lets them through |
 | `allow` | list of Sig | `[]` | requests that are reads even when their method is not GET, HEAD or OPTIONS, unless a `writes` signature also matches. A `url` that matches the empty string is refused; one not anchored with `^` prints a warning (below) |
 | `writes` | list of Sig | `[]` | requests that are writes even when their method is GET, HEAD or OPTIONS, and even when an `allow` signature matches too |
+| `graphql` | list of regex sources | `[]` | GraphQL endpoint URLs: a POST to one is read for its operation type, so a query is allowed and a mutation or subscription is a write even when `allow` matches (details below the table) |
 | `controls.text` | list of regex sources | `[]` | extra label patterns that make a control destructive |
 | `controls.icons` | list of class name prefixes | `[]` | a control with a class starting with one of these is destructive |
 | `defaultControls` | boolean | `true` | include the 12 built-in verbs (listed under Writes and controls) in the label pattern; `false` drops them |
@@ -48,6 +50,15 @@ Every key is optional, and unknown keys are ignored:
 | `defaultSuspectGets` | boolean | `true` | include the built-in suspect pattern (shown under Writes and controls); `false` drops it |
 | `log` | path or `null` | `"write-guard.jsonl"` | the JSONL audit log, relative to the process's working directory; `null` turns it off |
 | `logBodies` | boolean | `false` | add `body`, the first 500 characters of the request body, to request events, and `frame`, the first 500 characters of the frame, to WebSocket frame events (in `record()` and the log); off by default because bodies and frames can hold credentials and personal data |
+
+**`graphql`** is a list of regex sources. Absent means `[]`; anything but a list fails with `write-guard: graphql: must be a list`. Each entry is compiled with no flags (case-sensitive) and tested, unanchored, against the full request URL, like an `allow` `url`, and `compileConfig` returns them as `graphql: RegExp[]`:
+
+- An entry that is not a non-empty string, or does not compile, fails with `write-guard: graphql[<i>]: must be a non-empty regex string` or `write-guard: graphql[<i>]: does not compile: <message>`.
+- An entry that matches the empty string fails with `write-guard: graphql[<i>]: matches the empty string, so it can match any URL`.
+- An entry not starting with `^` is accepted, but `install` prints `write-guard: warning: graphql[<i>] "<src>": not anchored with ^, so it also matches any URL that merely contains a match` with `console.warn`, once per distinct text per process, from Node only (as for `allow`).
+- Only a POST to a matching URL is judged. Its body must be a string; a body that is not text (`FormData`, `Blob`) is not classified. The body is read as GraphQL over HTTP JSON: one object, or a non-empty array of objects (a batch), each with a non-empty string `query` and an `operationName` that is absent, `null` or a string. A body that is not JSON is read as one query when its `content-type` is `application/graphql`. Each `query` is scanned for its operations (strings, block strings and `#` comments are skipped, fragments are ignored). With a non-empty `operationName`, the operation of that name is chosen; otherwise the document must hold exactly one operation. A body that cannot be read this way, or whose operation cannot be chosen, is unclassified.
+- A body is a write when any chosen operation is a `mutation` or `subscription`, a read when every one is a `query`, and unclassified otherwise. An unclassified body is not judged by `graphql`: it falls through to `allow` and the method rule, so a POST stays a write unless an `allow` signature matches it. A persisted query (no query text) is unclassified, so allow it by hand.
+- A GET to a `graphql` URL is a read like any GET: its `?query=` is not parsed.
 
 A **Sig** (request signature) is `{ "method": M, "url": U, "body": B, "headers": H }`:
 
@@ -63,9 +74,13 @@ A **Sig** (request signature) is `{ "method": M, "url": U, "body": B, "headers":
 
 **A request is a write** by the first of these rules that applies, in this order:
 
-1. It matches a `writes` signature: it is a write, whatever its method and whatever `allow` says. `writes` always wins.
-2. Otherwise, it matches an `allow` signature: it is a read.
-3. Otherwise, its method, upper-cased, is not GET, HEAD or OPTIONS: it is a write. A GET, HEAD or OPTIONS is a read.
+1. It matches a `writes` signature: it is a write, whatever its method and whatever `allow` says. `writes` always wins. The reason is `<METHOD> matches writes[<j>]`.
+2. Otherwise, it is a POST to a URL matching a `graphql` entry and its body is a GraphQL mutation or subscription (see Config): it is a write, whatever `allow` says. The reason is `POST graphql[<i>] <mutation or subscription> <name or (anonymous)>`, followed by `; policy read-only` or `; policy observe`.
+3. Otherwise, it is a POST to a `graphql` URL and its body is a GraphQL query, or a batch of queries only: it is a read, with the reason `graphql[<i>] query <name or (anonymous)>` or, for a batch, `graphql[<i>] batch of <n> queries`.
+4. Otherwise (a body the guard cannot classify included), it matches an `allow` signature: it is a read.
+5. Otherwise, its method, upper-cased, is not GET, HEAD or OPTIONS: it is a write. A GET, HEAD or OPTIONS is a read.
+
+With `graphql` empty, only rules 1, 4 and 5 can apply, as before the key existed.
 
 A write is `block` under `read-only` and `observe` under `observe`; a read is `allow`. For example, `{ "method": "POST", "url": "^https://app[.]example[.]com/graphql" }` in `allow` lets a GraphQL endpoint through, and `{ "method": "POST", "url": "^https://app[.]example[.]com/graphql", "body": "mutation" }` in `writes` still blocks its mutations, because `writes` is checked first.
 
@@ -359,7 +374,7 @@ It reads an audit log and drafts `allow` entries for the writes it lists. It rea
 - **Input.** It reads the file as UTF-8 and splits it into lines. A line that does not parse with `JSON.parse` (an empty line included) is skipped, and so is a parsed line that is not an object with a non-empty string `method` (control events, websocket events, refused sockets). Of the rest it keeps `request` events whose `action` is `"observe"`, `"block"` or `"mocked"`; `suspect` events are skipped. An event whose `url` does not parse as an absolute URL (`new URL(url)` throws) is skipped too.
 - **Grouping.** Kept events are grouped by `method` and by origin plus path: `u.origin + u.pathname` for `u = new URL(url)`, so the query and the hash are dropped.
 - **Output.** It prints to stdout one JSON document, `JSON.stringify({ allow }, null, 2)` followed by a newline. `allow` holds one entry per group, `{ "method": M, "url": "^<origin and path, escaped>(?:[?#]|$)" }`, where escaped means each of the characters `\ ^ $ . * + ? ( ) [ ] { } |` is preceded by a backslash. Entries are sorted by `url`, then by `method`, both in code unit order. With nothing kept, `allow` is `[]`.
-- **Hints.** It prints to stderr one line per entry, in the same order: `<count> x <METHOD> <origin and path>`, where `<count>` is the number of events in the group and the origin and path are not escaped. When any event in the group has `next-action` in its `headerNames`, the line goes on with `: carries next-action, pin its action IDs with a headers entry`; otherwise, when the path ends with `/graphql`, with `: GraphQL, add an anchored body pattern`. It then exits 0.
+- **Hints.** It prints to stderr one line per entry, in the same order: `<count> x <METHOD> <origin and path>`, where `<count>` is the number of events in the group and the origin and path are not escaped. When any event in the group has `next-action` in its `headerNames`, the line goes on with `: carries next-action, pin its action IDs with a headers entry`; otherwise, when the path ends with `/graphql`, with `: GraphQL, add the URL to "graphql" to allow its queries`. It then exits 0.
 - **Errors.** With no argument, more than one argument, or a file that is missing or cannot be read, it prints `usage: playwright-write-guard-suggest <log.jsonl>` to stderr, nothing to stdout, and exits 1.
 
 For a log holding three blocked `POST https://app.example.test/graphql?op=1` events, stdout is:
@@ -375,7 +390,7 @@ For a log holding three blocked `POST https://app.example.test/graphql?op=1` eve
 }
 ```
 
-and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add an anchored body pattern`. Each entry allows every request with its method to its path, whatever the body or headers, so the output is a draft to review: narrow each entry with a `body` or `headers` pattern, and drop any that is a real write, before putting it in `allow`.
+and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add the URL to "graphql" to allow its queries`. Each entry allows every request with its method to its path, whatever the body or headers, so the output is a draft to review: narrow each entry with a `body` or `headers` pattern, and drop any that is a real write, before putting it in `allow`.
 
 ## What it cannot see
 
@@ -393,7 +408,10 @@ and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add an anchor
 - Toggles: `role=switch` and `role=checkbox` elements and checkbox inputs, and `change` events, are not judged (a `<button role=switch>` is still a button and is judged by its label).
 - Requests are classified only as well as the config: a write sent as GET, or a read sent as POST, needs a `writes` or `allow` signature.
 - GET requests with side effects: only a GET or HEAD whose path plus query matches the built-in suspect pattern or a `suspectGets` pattern is recorded, as `suspect`, and it is never blocked. Any other pass with no event unless a `writes` signature names them, and `observe` does not list ordinary GETs. The built-in pattern is short: it misses paths such as `/items/7:delete`, and it also marks harmless GETs such as the static asset `/static/icons/delete-icon.svg`.
-- Reads that send no query text (persisted GraphQL queries without an operation name): when nothing in the method, URL, headers or body tells such a read from a write, a signature that allows the endpoint allows its mutations too.
+- Reads that send no query text (persisted GraphQL queries without an operation name): when nothing in the method, URL, headers or body tells such a read from a write, a signature that allows the endpoint allows its mutations too. With `graphql`, such a request is not classified and falls through to `allow` and the method rule in the same way.
+- With `graphql`, only the operation type is judged: a query whose resolvers write is allowed.
+- GET requests to a `graphql` endpoint stay reads: their `?query=` is not parsed.
+- Bodies that are not text in the page (`FormData`, `Blob`, file uploads) are not parsed under `graphql`, so they fall through to `allow` and the method rule.
 - Request bodies unless `logBodies` is `true`, and header values: events record the method, URL, content type and header names. `logBodies` is off by default because bodies can hold credentials and personal data.
 - Bodies sent as `form` or `multipart` through an `APIRequestContext`, and Node `fetch` bodies that are not strings (streams, `FormData`, `URLSearchParams`, Blob, buffers) or that belong to a `Request` given to `fetch`: they are not judged by body (the method, URL and headers still are).
 - A request client's own `extraHTTPHeaders`: they are not part of the request the guard judges (nor is a `content-type` the client sets itself for `data`), although browser egress sees a context's `extraHTTPHeaders`. A `headers` signature set up for a header the client adds on its own therefore does not match a request client's send.

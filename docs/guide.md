@@ -83,14 +83,30 @@ Apps that read over POST stop working until those endpoints are in `allow`. To f
    npx playwright-write-guard-suggest write-guard.jsonl > allow.json
    ```
 
-   It reads the log and never writes a file. It groups the `observe`, `block` and `mocked` request events by method and by origin plus path, prints `{ "allow": [...] }` on stdout, one entry per group, and one hint line per entry on stderr: how many events it saw, and a note when the group carries `next-action` or its path ends in `/graphql`. A group of three blocked `POST https://app.example.test/graphql` events gives the entry `{ "method": "POST", "url": "^https://app\\.example\\.test/graphql(?:[?#]|$)" }` and the hint `3 x POST https://app.example.test/graphql: GraphQL, add an anchored body pattern`. Allowed GETs are never logged, and `suspect` events and events without a method are skipped.
-4. **Review before use.** The command cannot tell a read from a write: it lists every write the run attempted, the real ones included, and each entry allows every request with that method to that path, whatever its body or headers. Delete the entries that are real writes. Narrow the rest with a `body` pattern anchored at its start (GraphQL operation names) or a `headers` pattern (exact action IDs), as shown under [Use with Playwright Test](../README.md#use-with-playwright-test). Then put them in `allow`, run again under `read-only`, and check that the reads work and the writes are still blocked.
+   It reads the log and never writes a file. It groups the `observe`, `block` and `mocked` request events by method and by origin plus path, prints `{ "allow": [...] }` on stdout, one entry per group, and one hint line per entry on stderr: how many events it saw, and a note when the group carries `next-action` or its path ends in `/graphql`. A group of three blocked `POST https://app.example.test/graphql` events gives the entry `{ "method": "POST", "url": "^https://app\\.example\\.test/graphql(?:[?#]|$)" }` and the hint `3 x POST https://app.example.test/graphql: GraphQL, add the URL to "graphql" to allow its queries`. Allowed GETs are never logged, and `suspect` events and events without a method are skipped.
+4. **Review before use.** The command cannot tell a read from a write: it lists every write the run attempted, the real ones included, and each entry allows every request with that method to that path, whatever its body or headers. Delete the entries that are real writes. Move a GraphQL endpoint's entry to `graphql` instead (see [GraphQL](#graphql)), and narrow the rest with a `body` pattern anchored at its start or a `headers` pattern (exact action IDs). Then put them in `allow`, run again under `read-only`, and check that the reads work and the writes are still blocked.
 
 ## Allow and writes examples
 
 An `allow` URL that matches the empty string (`.*`, `^`, `x?`) can match any URL, so the config is refused with `write-guard: allow[0].url: matches the empty string, so it can match any URL`. An `allow` URL that is not anchored with `^` still works, but `install` prints `write-guard: warning: allow[0].url "/api/": not anchored with ^, so it also matches any URL that merely contains a match` (the text names the URL, here `/api/`) once per distinct text per process, from Node and never in a page.
 
-A `writes` signature always wins over `allow`. To let a GraphQL endpoint's reads through and still block its mutations, allow the URL and name the mutations in `writes` by a body pattern:
+A `writes` signature always wins over `allow`.
+
+### GraphQL
+
+To let a GraphQL endpoint's queries through and block its mutations, list its URL under `graphql`:
+
+```json
+{
+  "graphql": ["^https://app[.]example[.]test/graphql$"]
+}
+```
+
+A POST to that URL has its body read. A query is allowed, and a mutation or subscription is blocked even when an `allow` signature matches the same request. A batch is allowed only when every operation in it is a query. A body the guard cannot classify (a persisted query with no query text, an unbalanced document, a body that is not JSON, an `operationName` that names no operation) is not judged by `graphql`: it falls through to `allow` and then the method rule, so a POST stays blocked unless you allow it. Anchor each entry with `^`, as for `allow`: an unanchored one prints a warning.
+
+A `writes` signature is still checked first, so an old `writes` body pattern such as `"body": "mutation"` keeps winning: a query that merely mentions the word `mutation` stays blocked until you remove that pattern. With `graphql` in place you can usually drop it.
+
+Without `graphql`, allow the URL and name the mutations in `writes` by a body pattern, which also works for persisted queries and for bodies the guard cannot read:
 
 ```json
 {
@@ -99,7 +115,9 @@ A `writes` signature always wins over `allow`. To let a GraphQL endpoint's reads
 }
 ```
 
-The body pattern in the README's first example is anchored with `^\{`, so it matches only a single operation whose body starts with its name: a batched request (a JSON array) never matches, and neither does a body that puts `operationName` later. Check that your client sends `operationName` first, or the reads stay blocked (the safe direction). The pattern trusts your app's operation names, so list only names that read, and never leave a pattern unanchored.
+To allow only named operations by hand, anchor a `body` pattern at its start, for example `"^\\{\"operationName\":\"(ListItems|GetItem)\""`: it matches only a single operation whose body starts with its name, so a batched request (a JSON array) never matches, and neither does a body that puts `operationName` later. Check that your client sends `operationName` first, or the reads stay blocked (the safe direction). The pattern trusts your app's operation names, so list only names that read, and never leave a pattern unanchored.
+
+`graphql` judges only the operation type: a query whose resolvers write is allowed, and a GET to the endpoint stays a read. See the [limits](limits.md).
 
 Reads that differ from writes only in a header, such as Next.js server actions, can be allow-listed with a `headers` entry that names the exact action IDs that read, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/items$", "headers": { "next-action": "^(7f3a9c21|1b2e44d0)$" } }`. Every server action sends a `next-action` header, writes included, so a pattern that matches any ID allows every action; and action IDs can change between builds, so re-check them after a deploy. Header names compare case-insensitively and each value is a regex tested against that header on the request.
 

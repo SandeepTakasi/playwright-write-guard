@@ -88,23 +88,17 @@ Tests that only read through the page keep working. Under both policies, these c
 
 **Dialogs.** Under `read-only` the guard declines every dialog first, so a suite's own `accept` or `dismiss` on it throws (catch the error), and a dismissed `beforeunload` keeps the page. See [Dialogs](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#dialogs).
 
-The fixture guards each test's context, created with `serviceWorkers: 'block'`. By default it reads `write-guard.config.json` from the directory you run Playwright in. Every key is optional; a small example that lets two named GraphQL queries through and blocks everything else, mutations included:
+The fixture guards each test's context, created with `serviceWorkers: 'block'`. By default it reads `write-guard.config.json` from the directory you run Playwright in. Every key is optional; a small example that lets a GraphQL endpoint's queries through and blocks its mutations:
 
 ```json
 {
   "policy": "read-only",
-  "allow": [
-    {
-      "method": "POST",
-      "url": "^https://app[.]example[.]test/graphql$",
-      "body": "^\\{\"operationName\":\"(ListItems|GetItem)\""
-    }
-  ],
+  "graphql": ["^https://app[.]example[.]test/graphql$"],
   "controls": { "icons": ["icon-trash"] }
 }
 ```
 
-Without the `body` pattern, that signature would allow every request to the URL, mutations included. The pattern is anchored with `^\{`, so a batched request (a JSON array) never matches; list only operation names that read, and never leave a pattern unanchored. More in the [guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#allow-and-writes-examples).
+A POST to a `graphql` URL has its body read: a query is allowed, and a mutation or subscription is blocked even when `allow` matches. A body the guard cannot classify falls through to `allow` and the method rule, so it stays blocked. More in the [guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#allow-and-writes-examples).
 
 An `allow` URL that matches the empty string (`.*`, `^`, `x?`) is refused, and one not anchored with `^` prints a warning. A `writes` signature always wins over `allow`, so a GraphQL endpoint's reads can be allowed while its mutations stay blocked, and reads that differ from writes only in a header (Next.js server actions) can be allowed by exact action ID. Examples of both are in the [guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#allow-and-writes-examples).
 
