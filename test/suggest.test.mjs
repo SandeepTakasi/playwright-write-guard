@@ -28,7 +28,7 @@ test('the README worked example is reproduced exactly', () => {
     r.stdout,
     '{\n  "allow": [\n    {\n      "method": "POST",\n      "url": "^https://app\\\\.example\\\\.test/graphql(?:[?#]|$)"\n    }\n  ]\n}\n',
   );
-  assert.equal(r.stderr, '3 x POST https://app.example.test/graphql: GraphQL, add an anchored body pattern\n');
+  assert.equal(r.stderr, '3 x POST https://app.example.test/graphql: GraphQL, add the URL to "graphql" to allow its queries\n');
 });
 
 test('events group by method and by origin plus path; query and hash are dropped', () => {
@@ -125,7 +125,7 @@ test('the GraphQL hint needs the path to end with /graphql; the query does not c
   assert.deepEqual(r.stderr.trimEnd().split('\n'), [
     '1 x POST https://a.test/graphql/extra',
     '1 x POST https://a.test/notgraphql',
-    '1 x POST https://a.test/v1/graphql: GraphQL, add an anchored body pattern',
+    '1 x POST https://a.test/v1/graphql: GraphQL, add the URL to "graphql" to allow its queries',
     '1 x POST https://a.test/x',
   ]);
 });

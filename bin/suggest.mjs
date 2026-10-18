@@ -51,6 +51,6 @@ console.log(JSON.stringify({ allow: rows.map(({ method, url }) => ({ method, url
 for (const g of rows) {
   const hint = g.nextAction
     ? ': carries next-action, pin its action IDs with a headers entry'
-    : g.path.endsWith('/graphql') ? ': GraphQL, add an anchored body pattern' : '';
+    : g.path.endsWith('/graphql') ? ': GraphQL, add the URL to "graphql" to allow its queries' : '';
   console.error(`${g.count} x ${g.method} ${g.path}${hint}`);
 }
