@@ -2202,3 +2202,80 @@ W.fetch('/api/keep-' + T, { method: 'POST', body: 'x', keepalive: true });`));
   await leave(context, server, 'page.goto');
   expect(writesAt(server)).toEqual(SENDERS.flatMap((t) => [`POST /api/beacon-${t}-pagehide`, `POST /api/keep-${t}-pagehide`]).sort());
 });
+
+// --- graphql ---------------------------------------------------------------------------
+
+const GQL_QUERY = JSON.stringify({ query: 'query List { items { id } }' });
+const GQL_MUTATION = JSON.stringify({ query: 'mutation Rename { rename(id: 1) { id } }' });
+
+test('a graphql query from the page reaches the server and a mutation is refused with a warning', async ({ context }) => {
+  const server = await serve(context);
+  const guard = await install(context, { log: null, graphql: ['^https://app[.]test/api/graphql$'] });
+  const page = await open(context);
+  const seen = consoleWarnings(page);
+
+  expect(await post(page, '/api/graphql', GQL_QUERY)).toBe(SERVED);
+  expect(await post(page, '/api/graphql', GQL_MUTATION)).toBe('network error');
+  const reason = 'POST graphql[0] mutation Rename; policy read-only';
+  await expect.poll(() => seen).toContain(`write-guard refused POST ${APP}/api/graphql: ${reason}`);
+  expect(server.writes()).toEqual(['POST /api/graphql']);
+  expect(guard.record().events.map((e) => [e.action, e.url, e.reason])).toEqual([['block', `${APP}/api/graphql`, reason]]);
+});
+
+test('a graphql keepalive fetch from a leaving page delivers the query and not the mutation', async ({ context }) => {
+  const server = await listen(leavingPages(`
+W.fetch('/api/graphql?t=' + T, { method: 'POST', body: ${JSON.stringify(GQL_QUERY)}, keepalive: true }).catch(() => {});
+W.fetch('/api/graphql?t=' + T, { method: 'POST', body: ${JSON.stringify(GQL_MUTATION)}, keepalive: true }).then(() => keep(T, 'sent'), (e) => keep(T, e.message));`));
+  await install(context, { log: null, graphql: ['^http://127[.]0[.]0[.]1:[0-9]+/api/graphql[?]'] });
+  for (const how of LEAVES) {
+    const kept = await leave(context, server, how);
+    // A keepalive fetch allowed this way reaches the server, so the query arrives from every sender.
+    const posts = server.seen.filter((s) => s.line.startsWith('POST ')).map((s) => `${s.line} ${s.body}`).sort();
+    expect(posts, how).toEqual(SENDERS.map((t) => `POST /api/graphql?t=${t}-pagehide ${GQL_QUERY}`).sort());
+    if (kept) {
+      for (const t of SENDERS) {
+        expect(kept[`${t}-pagehide`], `${how} ${t}`).toBe(unloadRefusal('POST', `${server.origin}/api/graphql?t=${t}-pagehide`));
+      }
+    }
+  }
+});
+
+test('a graphql query through page.request is sent and a mutation refused', async ({ context }) => {
+  const server = await listen();
+  const guard = await install(context, { log: null, graphql: ['^http://127[.]0[.]0[.]1:[0-9]+/api/graphql$'] });
+  const page = await context.newPage();
+  const url = `${server.origin}/api/graphql`;
+  const doc = (q) => page.request.post(url, { data: q, headers: { 'Content-Type': 'application/graphql' } });
+
+  expect(await outcome(page.request.post(url, { data: JSON.parse(GQL_QUERY) }))).toBe('ok');
+  expect(await outcome(page.request.post(url, { data: JSON.parse(GQL_MUTATION) }))).toBe(refusal('POST', url));
+  expect(await outcome(doc('{ items { id } }'))).toBe('ok');
+  expect(await outcome(doc('mutation { rename(id: 1) { id } }'))).toBe(refusal('POST', url));
+  expect(server.seen.map((s) => `${s.line} ${s.body}`)).toEqual([`POST /api/graphql ${GQL_QUERY}`, 'POST /api/graphql { items { id } }']);
+  expect(guard.record().events.map((e) => e.reason)).toEqual([
+    'POST graphql[0] mutation Rename; policy read-only',
+    'POST graphql[0] mutation (anonymous); policy read-only',
+  ]);
+});
+
+test('an unanchored graphql URL prints one warning per process', async ({ browser }) => {
+  // The text names the index and the URL, so this test uses a URL that no other test in the
+  // process has used. The entry before it is anchored.
+  const text = 'write-guard: warning: graphql[1] "/gql-report-view": not anchored with ^, so it also matches any URL that merely contains a match';
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  const contexts = [await browser.newContext(), await browser.newContext(), await browser.newContext()];
+  try {
+    await install(contexts[0], { log: null, graphql: ['^https://app[.]test/graphql$', '/gql-report-view'] });
+    await install(contexts[1], { log: null, graphql: ['^https://app[.]test/graphql$', '/gql-report-view'] });
+    expect(warnings).toEqual([text]);
+
+    warnings.length = 0;
+    await install(contexts[2], { log: null, graphql: ['^https://app[.]test/graphql$', '^/gql-report-view'] });
+    expect(warnings).toEqual([]);
+  } finally {
+    console.warn = warn;
+    for (const c of contexts) await c.close();
+  }
+});

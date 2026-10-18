@@ -34,12 +34,17 @@ export async function install(context, config = {}) {
 // Each distinct warning is printed once per process, so a fixture that installs per test is not noisy.
 const warned = new Set();
 function warnUnanchored(config) {
-  (config?.allow ?? []).forEach((s, i) => {
-    if (typeof s.url !== 'string' || s.url.startsWith('^')) return;
-    const text = `allow[${i}].url ${JSON.stringify(s.url)}: not anchored with ^, so it also matches any URL that merely contains a match`;
+  const say = (text) => {
     if (warned.has(text)) return;
     warned.add(text);
     console.warn(`write-guard: warning: ${text}`);
+  };
+  const tail = 'not anchored with ^, so it also matches any URL that merely contains a match';
+  (config?.allow ?? []).forEach((s, i) => {
+    if (typeof s.url === 'string' && !s.url.startsWith('^')) say(`allow[${i}].url ${JSON.stringify(s.url)}: ${tail}`);
+  });
+  (config?.graphql ?? []).forEach((src, i) => {
+    if (!src.startsWith('^')) say(`graphql[${i}] ${JSON.stringify(src)}: ${tail}`);
   });
 }
 

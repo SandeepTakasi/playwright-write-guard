@@ -43,6 +43,16 @@ export interface Config {
    * and even when an `allow` signature also matches them.
    */
   writes?: Sig[];
+  /**
+   * Default `[]`. Regex sources for GraphQL endpoints, compiled with no flags and tested
+   * unanchored against the full URL of a POST, like `allow` URLs; a source that matches the
+   * empty string throws. A POST to a matching URL is judged by its body (a JSON object or a
+   * non-empty array of them, each with `query` and an optional `operationName`, or an
+   * `application/graphql` document): a mutation or subscription is a write even when `allow`
+   * matches it, a query is a read, and a body it cannot read falls through to `allow` and the
+   * method rule. A `writes` match still wins. A GET is not judged by this rule.
+   */
+  graphql?: string[];
   controls?: {
     /** Regex sources, compiled case-insensitive, added to the built-in verbs. */
     text?: string[];
@@ -120,6 +130,8 @@ export interface CompiledConfig {
   suspect: RegExp | null;
   log: string | null;
   logBodies: boolean;
+  /** `graphql`, each compiled with no flags. */
+  graphql: RegExp[];
 }
 
 export interface RequestInput {
@@ -173,8 +185,9 @@ export function compileConfig(raw?: Config | null): CompiledConfig;
 
 /**
  * `block` (read-only) or `observe` (observe) for a write, else `allow`. A `writes` match is a
- * write first; else an `allow` match is a read; else a method other than GET, HEAD or OPTIONS
- * is a write.
+ * write first; else a POST to a `graphql` URL whose body selects a mutation or subscription is a
+ * write, and one whose body selects only queries is a read; else an `allow` match is a read;
+ * else a method other than GET, HEAD or OPTIONS is a write.
  */
 export function decideRequest(request: RequestInput, config: CompiledConfig): RequestDecision;
 

@@ -31,6 +31,7 @@ test('compileConfig applies every default for null, undefined and {}', () => {
     assert.equal(c.websockets, 'allow');
     assert.equal(c.log, 'write-guard.jsonl');
     assert.equal(c.logBodies, false);
+    assert.deepEqual(c.graphql, []);
   }
 });
 
@@ -658,6 +659,257 @@ test('a writes signature still makes a suspect GET a write, and decideRequest ig
   assert.equal(decideRequest(req('GET', 'https://a.test/logout'), cfg()).action, 'allow');
 });
 
+// --- graphql ---------------------------------------------------------------------------
+
+const GQL = 'https://a.test/graphql';
+const GQL_RAW = { graphql: ['^https://a[.]test/graphql$'] };
+const gql = (extra = {}) => cfg({ ...GQL_RAW, ...extra });
+const gq = (body, c = gql(), headers = undefined) => decideRequest({ method: 'POST', url: GQL, body, headers }, c);
+const ask = (query, operationName) => JSON.stringify(operationName === undefined ? { query } : { query, operationName });
+const READ = (what, i = 0) => ({ action: 'allow', reason: `graphql[${i}] ${what}` });
+const WRITE = (what, i = 0) => ({ action: 'block', reason: `POST graphql[${i}] ${what}; policy read-only` });
+// What a body the rule cannot read gets with no allow entry: the method rule.
+const UNKNOWN = { action: 'block', reason: 'POST is not a read method; policy read-only' };
+const TWO = 'query List { items { id } } mutation Rename { rename(id: 1) { id } }';
+
+test('graphql defaults to an empty list and compiles one RegExp per source with no flags', () => {
+  for (const raw of [null, undefined, {}, { graphql: [] }]) assert.deepEqual(cfg(raw).graphql, []);
+  const g = cfg({ graphql: ['^https://a[.]test/graphql$', '/api/gql'] }).graphql;
+  assert.equal(g.length, 2);
+  for (const re of g) {
+    assert.ok(re instanceof RegExp);
+    assert.equal(re.flags, '');
+  }
+  assert.equal(g[1].source, '\\/api\\/gql');
+});
+
+test('malformed graphql throws with the contract messages', () => {
+  for (const v of ['x', {}, 5, null, true]) {
+    assert.throws(() => cfg({ graphql: v }), { message: 'write-guard: graphql: must be a list' }, String(v));
+  }
+  for (const v of ['', 5, null, undefined, {}, ['x']]) {
+    assert.throws(() => cfg({ graphql: ['^ok', v] }), { message: 'write-guard: graphql[1]: must be a non-empty regex string' }, String(v));
+  }
+  assert.throws(() => cfg({ graphql: ['('] }), (e) => e.message.startsWith('write-guard: graphql[0]: does not compile: '));
+  assert.throws(() => cfg({ graphql: ['^ok', '^ok', '['] }), (e) => e.message.startsWith('write-guard: graphql[2]: does not compile: '));
+  for (const url of ['.*', '^', 'x?', '(?:)', 'a|']) {
+    assert.throws(
+      () => cfg({ graphql: ['^ok', url] }),
+      { message: 'write-guard: graphql[1]: matches the empty string, so it can match any URL' },
+      url,
+    );
+  }
+});
+
+test('a graphql URL is tested unanchored and case-sensitive against the full URL, the first match named', () => {
+  const c = cfg({ graphql: ['/graphql$', 'a[.]test'] });
+  const q = ask('query List { items { id } }');
+  const at = (url) => decideRequest({ method: 'POST', url, body: q }, c);
+  assert.deepEqual(at('https://a.test/graphql'), READ('query List', 0), 'both match, the first is named');
+  assert.deepEqual(at('https://b.test/v1/graphql'), READ('query List', 0), 'unanchored');
+  assert.deepEqual(at('https://a.test/other'), READ('query List', 1));
+  assert.deepEqual(at('https://b.test/GRAPHQL'), UNKNOWN, 'case-sensitive');
+  assert.deepEqual(at('https://b.test/graphql/v1'), UNKNOWN);
+  assert.deepEqual(decideRequest({ method: 'POST', url: 'https://b.test/x?to=/graphql', body: q }, cfg({ graphql: ['/graphql'] })),
+    READ('query List'), 'the query string is tested too');
+});
+
+test('graphql: a named query is a read and a named mutation a write', () => {
+  assert.deepEqual(gq(ask('query List { items { id } }')), READ('query List'));
+  assert.deepEqual(gq(ask('mutation Rename { rename(id: 1) { id } }')), WRITE('mutation Rename'));
+  assert.deepEqual(gq(ask('query List($first: Int = 2) @cached { items(first: $first) { id } }')), READ('query List'));
+});
+
+test('graphql: an anonymous operation is named (anonymous)', () => {
+  assert.deepEqual(gq(ask('{ items { id } }')), READ('query (anonymous)'));
+  assert.deepEqual(gq(ask('query { items { id } }')), READ('query (anonymous)'));
+  assert.deepEqual(gq(ask('query ($first: Int) { items(first: $first) { id } }')), READ('query (anonymous)'));
+  assert.deepEqual(gq(ask('query 2 { items { id } }')), READ('query (anonymous)'), 'a number is not a name');
+  assert.deepEqual(gq(ask('mutation { rename(id: 1) { id } }')), WRITE('mutation (anonymous)'));
+  assert.deepEqual(gq(ask('mutation ($id: ID!, $in: Input = {name: "x"}) { rename(id: $id) { id } }')), WRITE('mutation (anonymous)'));
+});
+
+test('graphql: the name is only the token right after the keyword, so a directive is never a name', () => {
+  assert.deepEqual(gq(ask('query @cached { a }')), READ('query (anonymous)'));
+  assert.deepEqual(gq(ask('mutation @x { a }')), WRITE('mutation (anonymous)'));
+  assert.deepEqual(gq(ask('query Name @x { a }')), READ('query Name'));
+  assert.deepEqual(gq(ask('query ($a: Int) @x { a }')), READ('query (anonymous)'));
+  assert.deepEqual(gq(ask('mutation @x { a }', 'x')), UNKNOWN, 'a directive name cannot select an operation');
+});
+
+test('graphql: a subscription is a write', () => {
+  assert.deepEqual(gq(ask('subscription Feed { items { id } }')), WRITE('subscription Feed'));
+  assert.deepEqual(gq(ask('subscription { items { id } }')), WRITE('subscription (anonymous)'));
+});
+
+test('graphql: operationName chooses the query or the mutation of a two-operation document', () => {
+  assert.deepEqual(gq(ask(TWO, 'List')), READ('query List'));
+  assert.deepEqual(gq(ask(TWO, 'Rename')), WRITE('mutation Rename'));
+});
+
+test('graphql: a missing, unknown or duplicated operation name is unknown', () => {
+  for (const name of [undefined, null, '']) assert.deepEqual(gq(ask(TWO, name)), UNKNOWN, `two operations, operationName ${name}`);
+  assert.deepEqual(gq(ask(TWO, 'Other')), UNKNOWN, 'no operation of that name');
+  assert.deepEqual(gq(ask('query List { items { id } }', 'Other')), UNKNOWN, 'the only operation has another name');
+  assert.deepEqual(gq(ask('{ items { id } }', 'List')), UNKNOWN, 'an anonymous operation has no name');
+  assert.deepEqual(gq(ask('query A { a } mutation A { b }', 'A')), UNKNOWN, 'two operations of that name');
+  assert.deepEqual(gq(ask('fragment F on Item { id }')), UNKNOWN, 'no operation at all');
+  // With no name to choose by, a document's only operation is selected.
+  for (const name of [undefined, null, '']) assert.deepEqual(gq(ask('query List { items { id } }', name)), READ('query List'));
+});
+
+test('graphql: a batch of queries is a read', () => {
+  const batch = JSON.stringify([{ query: 'query A { a }' }, { query: '{ b }', operationName: null }, { query: TWO, operationName: 'List' }]);
+  assert.deepEqual(gq(batch), READ('batch of 3 queries'));
+  assert.deepEqual(gq(JSON.stringify([{ query: 'query A { a }' }])), READ('batch of 1 queries'));
+});
+
+test('graphql: a batch with one mutation is a write named by its first write', () => {
+  const batch = JSON.stringify([{ query: 'query A { a }' }, { query: TWO, operationName: 'Rename' }, { query: 'subscription S { s }' }]);
+  assert.deepEqual(gq(batch), WRITE('mutation Rename'));
+  // Even next to an item that cannot be read.
+  assert.deepEqual(gq(JSON.stringify([{ query: 'nonsense' }, { query: 'subscription S { s }' }])), WRITE('subscription S'));
+});
+
+test('graphql: a batch with one unknown item is unknown', () => {
+  assert.deepEqual(gq(JSON.stringify([{ query: 'query A { a }' }, { query: TWO }])), UNKNOWN);
+  assert.deepEqual(gq(JSON.stringify([{ query: 'query A { a }' }, { query: 'query B { b' }])), UNKNOWN);
+});
+
+test('graphql: a body of any other shape is unknown, whatever else it holds', () => {
+  const m = { query: 'mutation Rename { rename { id } }' };
+  for (const body of ['[]', '[1]', JSON.stringify([m, 2]), JSON.stringify([m, null]), JSON.stringify([m, [m]]), 'null', '5',
+    JSON.stringify('mutation Rename { rename { id } }'), JSON.stringify([m, { variables: {} }])]) {
+    assert.deepEqual(gq(body), UNKNOWN, body);
+  }
+  // query must be a non-empty string, operationName absent, null or a string.
+  for (const item of [{}, { query: '' }, { query: 5 }, { query: null }, { query: ['{ a }'] }, { query: { 0: '{', 1: '}', length: 2 } },
+    { query: '{ a }', operationName: 5 }, { query: '{ a }', operationName: {} }, { query: '{ a }', operationName: ['x'] },
+    { query: '{ a }', operationName: false }]) {
+    assert.deepEqual(gq(JSON.stringify(item)), UNKNOWN, JSON.stringify(item));
+    assert.deepEqual(gq(JSON.stringify([{ query: '{ a }' }, item])), UNKNOWN, `in a batch ${JSON.stringify(item)}`);
+  }
+  assert.deepEqual(gq(JSON.stringify([{ query: '{ a }', operationName: 5 }, m])), UNKNOWN, 'a malformed item makes even a mutation batch unknown');
+});
+
+test('graphql: a body that is not a string is unknown', () => {
+  for (const body of [null, undefined, 5, { toString: () => ask('mutation Rename { rename { id } }') },
+    Buffer.from(ask('query List { items { id } }'))]) {
+    assert.deepEqual(gq(body), UNKNOWN, String(body));
+    assert.deepEqual(gq(body, gql(), { 'content-type': 'application/graphql' }), UNKNOWN, String(body));
+  }
+});
+
+test('graphql: an application/graphql body is one document with no operation name', () => {
+  const ct = (v) => ({ 'Content-Type': v });
+  assert.deepEqual(gq('mutation Rename { rename { id } }', gql(), ct('application/graphql')), WRITE('mutation Rename'));
+  assert.deepEqual(gq('query List { items { id } }', gql(), ct('Application/GraphQL; charset=utf-8')), READ('query List'));
+  assert.deepEqual(gq('{ items { id } }', gql(), ct('  application/graphql  ;charset=utf-8')), READ('query (anonymous)'));
+  assert.deepEqual(gq('{ items { id } }', gql(), { 'content-type': ' APPLICATION/GRAPHQL ' }), READ('query (anonymous)'));
+  assert.deepEqual(gq(TWO, gql(), ct('application/graphql')), UNKNOWN, 'two operations and no name');
+  // A body that parses as JSON is read as JSON whatever its content type.
+  assert.deepEqual(gq(ask('query List { items { id } }'), gql(), ct('application/graphql')), READ('query List'));
+  assert.deepEqual(gq('"mutation Rename { rename { id } }"', gql(), ct('application/graphql')), UNKNOWN);
+});
+
+test('graphql: a body that is neither JSON nor application/graphql is unknown', () => {
+  for (const headers of [undefined, {}, { 'content-type': 'text/plain' }, { 'content-type': 'application/json' },
+    { 'content-type': 'application/graphql-response+json' }, { 'content-type': 'application/graphqlx' },
+    { 'content-type': 'text/plain; application/graphql' }, { 'content-type': 5 }, { 'x-type': 'application/graphql' }]) {
+    assert.deepEqual(gq('query List { items { id } }', gql(), headers), UNKNOWN, JSON.stringify(headers));
+    assert.deepEqual(gq('mutation Rename { rename { id } }', gql(), headers), UNKNOWN, JSON.stringify(headers));
+  }
+});
+
+test('graphql: braces and the word mutation inside a string, a block string or a comment are skipped', () => {
+  const read = (q) => assert.deepEqual(gq(ask(q)), READ('query List'), q);
+  read('query List { items(filter: "} mutation X { x } {") { id } }');
+  read('query List { items(filter: "a \\" } mutation X { x } \\\\") { id } }');
+  read('query List { items(filter: """ } mutation X { x } \\""" { """) { id } }');
+  read('query List { items(filter: """ " } """) { id } }');
+  read('# mutation X { x }\nquery List { items { id } } # }');
+  read('query List { items { id } } # {\r');
+  read('# mutation X { x }\rquery List { items { id } }');
+  read(`${String.fromCharCode(0xfeff)}query List, { items, { id } },,`);
+  read('query List { items(filter: "") { id } }');
+  read('query List { items(filter: """""") { id } }');
+  // And the real operation after such a string is still seen.
+  assert.deepEqual(gq(ask('query A { a(s: "}") } mutation B { b(s: """{""") }', 'B')), WRITE('mutation B'));
+  assert.deepEqual(gq(ask('query A { a(s: "\\"}") } mutation B { b }', 'B')), WRITE('mutation B'));
+  assert.deepEqual(gq(ask('# }\nmutation B { b }')), WRITE('mutation B'));
+});
+
+test('graphql: a fragment is ignored', () => {
+  assert.deepEqual(gq(ask('fragment F on Item { id } query List { items { ...F } }')), READ('query List'));
+  assert.deepEqual(gq(ask('fragment F on Item { id } mutation Rename { rename { ...F } }')), WRITE('mutation Rename'));
+  assert.deepEqual(gq(ask('query List { items { ...F } } fragment F on Item { id }')), READ('query List'));
+  assert.deepEqual(gq(ask('fragment List on Item { id } mutation Rename { rename { ...List } }', 'List')), UNKNOWN, 'a fragment is not an operation');
+});
+
+test('graphql: unbalanced brackets, an unterminated string or a definition that never opens is unknown', () => {
+  for (const q of ['query List { items { id }', 'query List { items { id } } }', 'query List { items ) }', 'query List { items(id: 1 }',
+    'query List { items [ }', 'query List { a ( } )', '} query List { a }', 'mutation Rename { rename(id: "1) { id } }', 'query List { a(s: """x) { id } }',
+    'query List { a(s: "\\") }', 'query List', 'query List($a: Int)', 'mutation', 'fragment F on Item']) {
+    assert.deepEqual(gq(ask(q)), UNKNOWN, q);
+  }
+});
+
+test('graphql: anything but a definition at the top level is unknown', () => {
+  for (const q of ['items { id }', 'Query List { a }', 'MUTATION Rename { a }', '"x" query List { a }', 'query List { a } extra',
+    '1 query List { a }', 'query List { a } !', '( query List { a } )', '[ { a } ]', '$x query List { a }']) {
+    assert.deepEqual(gq(ask(q)), UNKNOWN, q);
+  }
+});
+
+test('graphql: only a POST to a listed URL is judged', () => {
+  const m = ask('mutation Rename { rename { id } }');
+  assert.deepEqual(decideRequest({ method: 'GET', url: GQL, body: m }, gql()),
+    { action: 'allow', reason: 'GET is a read method and matches no writes signature' });
+  assert.deepEqual(decideRequest({ method: 'PUT', url: GQL, body: ask('query List { a }') }, gql()),
+    { action: 'block', reason: 'PUT is not a read method; policy read-only' });
+  assert.deepEqual(decideRequest({ method: 'post', url: GQL, body: m }, gql()), WRITE('mutation Rename'), 'the method in any case');
+  assert.deepEqual(decideRequest({ method: 'POST', url: 'https://a.test/other', body: ask('query List { a }') }, gql()), UNKNOWN);
+  assert.deepEqual(decideRequest({ method: 'POST', url: `${GQL}/x`, body: ask('query List { a }') }, gql()), UNKNOWN);
+});
+
+test('graphql precedence: writes, then a GraphQL write, then a GraphQL read, then allow and the method rule', () => {
+  const allow = [{ method: 'POST', url: '^https://a[.]test/graphql$' }];
+  // A mutation is a write even when allow matches it.
+  assert.deepEqual(gq(ask('mutation Rename { rename { id } }'), gql({ allow })), WRITE('mutation Rename'));
+  // A GraphQL read is named as one, not by allow.
+  assert.deepEqual(gq(ask('query List { a }'), gql({ allow })), READ('query List'));
+  // A writes match wins over a GraphQL read.
+  assert.deepEqual(gq(ask('query List { a }'), gql({ allow, writes: [{ method: 'POST', url: '/graphql$', body: 'List' }] })),
+    { action: 'block', reason: 'POST matches writes[0]; policy read-only' });
+  // Unknown falls through to allow, then to the method rule.
+  assert.deepEqual(gq(ask(TWO), gql({ allow })), { action: 'allow', reason: 'allow[0] marks it a read' });
+  assert.deepEqual(gq('not json', gql({ allow })), { action: 'allow', reason: 'allow[0] marks it a read' });
+  assert.deepEqual(gq(ask(TWO)), UNKNOWN);
+  // Under observe a GraphQL write is observed and a read allowed.
+  const o = gql({ policy: 'observe', allow });
+  assert.deepEqual(gq(ask('mutation Rename { rename { id } }'), o),
+    { action: 'observe', reason: 'POST graphql[0] mutation Rename; policy observe' });
+  assert.deepEqual(gq(ask('subscription { s }'), o), { action: 'observe', reason: 'POST graphql[0] subscription (anonymous); policy observe' });
+  assert.deepEqual(gq(ask('query List { a }'), o), READ('query List'));
+  assert.deepEqual(gq(ask('query List { a }'), gql({ policy: 'observe' })), READ('query List'));
+  assert.deepEqual(gq(ask(TWO), gql({ policy: 'observe' })), { action: 'observe', reason: 'POST is not a read method; policy observe' });
+});
+
+test('with graphql absent or empty, every result is the one 0.6.1 gave', () => {
+  assert.deepEqual(cfg({ graphql: [] }), cfg({}));
+  const allow = [{ method: 'POST', url: '/graphql$' }];
+  const m = ask('mutation Rename { rename { id } }');
+  const q = ask('query List { a }');
+  for (const extra of [{}, { graphql: [] }]) {
+    assert.deepEqual(gq(m, cfg(extra)), UNKNOWN);
+    assert.deepEqual(gq(q, cfg(extra)), UNKNOWN);
+    assert.deepEqual(gq('mutation Rename { a }', cfg(extra), { 'content-type': 'application/graphql' }), UNKNOWN);
+    assert.deepEqual(gq(m, cfg({ ...extra, allow })), { action: 'allow', reason: 'allow[0] marks it a read' });
+    assert.deepEqual(gq(m, cfg({ ...extra, policy: 'observe' })), { action: 'observe', reason: 'POST is not a read method; policy observe' });
+    assert.deepEqual(decideRequest(req('GET', GQL), cfg(extra)), { action: 'allow', reason: 'GET is a read method and matches no writes signature' });
+  }
+});
+
 // --- injection: every function works when rebuilt from its own source --------------
 
 test('each function behaves identically when rebuilt from its own source text', () => {
@@ -666,7 +918,8 @@ test('each function behaves identically when rebuilt from its own source text', 
   const HDR = { allow: [{ method: 'report', url: '/h$', headers: { 'X-A': '^1$' } }], logBodies: true };
   const WS = { websocketWrites: ['deleteItem'], suspectGets: ['/export-all'], defaultSuspectGets: true };
   for (const raw of [undefined, { policy: 'observe' }, HDR, WS, { defaultSuspectGets: false },
-    { ...GRAPHQL, controls: { icons: ['icon-trash'], text: ['nuke'] } }]) {
+    { ...GRAPHQL, controls: { icons: ['icon-trash'], text: ['nuke'] } },
+    { ...GQL_RAW, allow: [{ method: 'POST', url: '^https://a[.]test/graphql$' }] }]) {
     const c1 = cfg(raw);
     const c2 = compile2(raw);
     assert.deepEqual(c2, c1);
@@ -680,7 +933,10 @@ test('each function behaves identically when rebuilt from its own source text', 
     }
     for (const r of [req('POST', 'https://a.test/graphql', MUTATION), req('POST', 'https://a.test/graphql', QUERY),
       req('DELETE', 'https://a.test/api/1'), req('GET', 'https://a.test/x'), req('post', 'https://a.test/api/search'),
-      { method: 'report', url: 'https://a.test/h', headers: { 'x-a': '1' } }, { method: 'REPORT', url: 'https://a.test/h' }]) {
+      { method: 'report', url: 'https://a.test/h', headers: { 'x-a': '1' } }, { method: 'REPORT', url: 'https://a.test/h' },
+      req('POST', GQL, ask(TWO)), req('POST', GQL, ask(TWO, 'Rename')), req('POST', GQL, ask('# }\n{ a(s: """}""", t: "\\"") }')),
+      req('POST', GQL, JSON.stringify([{ query: '{ a }' }, { query: 'query B { b }' }])),
+      { method: 'POST', url: GQL, body: 'subscription S { s }', headers: { 'Content-Type': 'application/graphql; charset=utf-8' } }]) {
       assert.deepEqual(request2(r, c2), decideRequest(r, c1));
     }
   }
