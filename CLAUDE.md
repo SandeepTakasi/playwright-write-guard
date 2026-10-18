@@ -19,6 +19,7 @@ Guide for contributors and coding agents working in this repository.
 ## Tests
 
 - Every guard rule needs a test that fails when the rule is reverted or weakened. Check a new rule by breaking it on purpose in a scratch copy and watching a test fail; a green suite alone proves nothing.
+- A config example in the docs is run through `compileConfig` and the decide function it relies on, with realistic inputs that should and should not match, before it is committed; then grep the docs for older versions of it. A WebSocket frame is JSON text, so test escaped newlines and comments too.
 - Each mutation check runs in its own scratch folder outside the repository, never in `test/` or `src/`: parallel runs that share one overwrite each other's copies and report false kills.
 - A scratch copy may symlink the repo's `node_modules`, but never runs `npm install` in it: the install rewrites the repo's own dependencies. Restore them with `npm ci` if that happens.
 - A long mutation run needs AC power and `caffeinate -i`: a sleeping machine turns kills into timeouts and leaves orphaned browsers. Re-run any mutant killed only by a timeout, or killed unusually slowly, before counting it.
