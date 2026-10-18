@@ -106,7 +106,15 @@ A POST to that URL has its body read. A query is allowed, and a mutation or subs
 
 **Using automatic persisted queries (APQ)?** The client's first request sends only a hash, with no query text, so `graphql` cannot classify it and it is blocked; the client then sees a network error instead of a "persisted query not found" reply and does not retry with the full query, so reads stay broken. Either have the client send hashed queries as GET (Apollo Client's `useGETForHashedQueries: true`), which the guard treats as reads, or turn APQ off where the guard runs, or allow the hashes of your read operations by hand, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/graphql$", "body": "\"sha256Hash\":\"(3f1c9a...|8b2e47...)\"" }` with the full hashes. Never allow every hash: mutations are sent as hashes too.
 
-**GraphQL over WebSocket** (`graphql-ws`, subscriptions transports) is not read by `graphql`, and those messages can carry mutations. Name them with `websocketWrites`, for example `"websocketWrites": ["\"query\"\\s*:\\s*\"\\s*mutation\\b"]` (see [WebSocket frames](#websocket-frames-and-suspect-gets)).
+**GraphQL over WebSocket** (`graphql-ws`, subscriptions transports) is not read by `graphql`, and those messages can carry mutations. Name them with `websocketWrites` (see [WebSocket frames](#websocket-frames-and-suspect-gets)). This pattern blocks any frame whose `query` text holds the keyword `mutation`, wherever it sits, including after a newline or a comment, in both the `graphql-ws` `subscribe` and the older `start` messages:
+
+```json
+{
+  "websocketWrites": ["\"query\"\\s*:\\s*\"(?:(?:[^\"\\\\]|\\\\.)*?(?:[^A-Za-z0-9_\"\\\\]|\\\\[nrtbf]))?mutation\\b"]
+}
+```
+
+It is a text match, not the `graphql` parser, so it blocks more than the mutations a server would run: a document that holds a mutation is blocked even when `operationName` picks a query, and so is a query whose comment mentions the word. It lets through a field such as `mutationCount` and the word inside a string argument. It never sees a frame that carries only a persisted query's hash.
 
 A `writes` signature is still checked first, so an old `writes` body pattern such as `"body": "mutation"` keeps winning: a query that merely mentions the word `mutation` stays blocked until you remove that pattern. With `graphql` in place you can usually drop it.
 
