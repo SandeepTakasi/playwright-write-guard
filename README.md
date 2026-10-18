@@ -13,6 +13,8 @@ A read-only safety net for Playwright tests and AI browser agents: it blocks wri
 ```
 npm i -D playwright-write-guard
 npx playwright install chromium
+# log in, then close the window
+npx playwright codegen --save-storage=state.json https://app.example.com
 npx playwright-write-guard-browser --storage-state state.json
 ```
 
@@ -22,7 +24,7 @@ The launcher prints `endpoint: ws://...`. Point Playwright MCP at that endpoint 
 npx @playwright/mcp@0.0.83 --endpoint ws://127.0.0.1:<port>/<id>
 ```
 
-`--print-mcp-config` also prints the JSON to paste into an MCP client's settings. `state.json` is a saved login (see [logging in](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#logging-in)); drop `--storage-state` if the app needs no login.
+`--print-mcp-config` also prints the JSON to paste into an MCP client's settings. `state.json` holds a live session, so keep it out of version control (see [logging in](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#logging-in)). If the app needs no login, skip the codegen step and `--storage-state`.
 
 **Playwright Test:**
 
@@ -37,29 +39,17 @@ import { test, expect } from 'playwright-write-guard/test';
 
 That one import is the whole change. If the click check refuses a control your app uses for reading, set `"defaultControls": false` in `write-guard.config.json` and name your own verbs in `controls.text`.
 
-## Overview
-
-It blocks every request whose method is not GET, HEAD or OPTIONS (unless you allow-list it) at the network layer, refuses destructive clicks inside the page, and writes a JSON audit log. Use it with Playwright Test, or with Playwright MCP and the Playwright CLI through an `initPage` entry or a launcher. No runtime dependencies, no build step. It is a safety net, not a security boundary: a restricted test account is the boundary.
-
 ## What it is and why
 
-Pointing an automated browser at a real app is risky when the run should only look. A test that clicks through a settings page, or an agent asked to "find out what this dashboard shows", can press Save, Delete or Send, or fire a POST, and change real data.
+Pointing an automated browser at a real app is risky when the run should only look: a test or an agent can press Save, Delete or Send, or fire a POST, and change real data. This package puts a read-only guard in front of the browser. Use it with Playwright Test, or with Playwright MCP and the Playwright CLI through an `initPage` entry or a launcher. No runtime dependencies, no build step. It is a safety net, not a security boundary: a restricted test account is the boundary.
 
-This package puts a read-only guard in front of the browser:
-
-- **Requests.** Any request whose method is not GET, HEAD or OPTIONS is blocked, unless a signature in your `allow` list says it is really a read (a read-only GraphQL endpoint, for example). Requests that are really writes but look like reads can be named in `writes`, and `writes` always wins: a request that matches both an `allow` and a `writes` signature is a write. The same rules judge the sends of `context.request` and `page.request`, and, in the Playwright Test fixture, the `request` fixture and Node's `fetch` inside a test: a GET goes through and a write is refused.
-- **Clicks.** A click, form submit, or Enter or Space keypress on a control whose label is a destructive verb (Save, Delete, Publish, Send, Archive, Pay, Purchase, Log out and so on) is stopped inside the page before the app's own handlers run, and the page's console gets a `write-guard refused "<label>": <reason>` warning, so an agent that reads the console learns why nothing happened. A link that navigates is judged by its URL, not its text (see [Suspect GETs](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#websocket-frames-and-suspect-gets)). Native confirmation dialogs are declined.
-- **Log.** Every write it blocked, or only observed under the `observe` policy, is recorded as one JSON line, and so is every write one of your own routes mocked and every side-effecting GET it noticed (`suspect`).
-
-What it guarantees, and what it does not:
-
-- **Enforced:** every HTTP request the pages of a guarded context send is judged at the network layer, whatever triggered it, with the exceptions below. This is the main layer: a "Continue" button that submits a payment still sends a request, and that request is judged. WebSockets are the first exception: by default a socket opens and each open is recorded as a `websocket` event, but its messages, writes included, are not judged or logged. List patterns in `websocketWrites` to judge the text frames the page sends (see [WebSocket frames](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#websocket-frames-and-suspect-gets)); `websockets: "block"` refuses the sockets the guard routes, and apps that need a socket then do not load. The others are sends from a page that is being left, HTTP from a `SharedWorker` and requests made with `fetchLater`, which Playwright does not route (next item).
-- **Leaving pages, shared workers and `fetchLater`:** Playwright does not route a request a page starts while being left, the HTTP of a `SharedWorker`, or a `fetchLater` request. Under `read-only` the page script judges a leaving page's writes itself and removes `window.SharedWorker` and `window.fetchLater`; under `observe` none of them is judged or recorded. The details are in the [guide](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#leaving-pages-shared-workers-and-fetchlater).
-- **Heuristic:** which requests count as writes, and which controls count as destructive.
-  - Requests are judged by method, unless your `allow` and `writes` signatures say otherwise. Apps that read over POST (GraphQL, search APIs, server actions, long polling) stop working until those endpoints are allow-listed. A run under `observe` lists them (method, URL, content type and header names; set `logBodies: true` to add the first 500 characters of each body, which can hold credentials, so it is off by default), and [a command drafts the allow entries from that log](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#writing-an-allow-list). Events carry header names, never values, so reads told apart only by a header value have to be found in the app's own code or network panel. GETs with side effects (logout, unsubscribe, `?action=delete`) pass, but a GET whose path or query matches a short built-in pattern is recorded as a `suspect` event; it is never blocked. Other side-effecting GETs pass with no event unless a `writes` signature names them.
-  - Controls are judged by label, and only real controls: buttons, links with an `href`, elements with a button, menuitem, link or tab role, and submit, button or image inputs. A link that navigates is judged by its URL instead of its label. The click check is a second layer that stops the app before it starts a write. Its built-in verb list is short (save, delete, remove, publish, send, archive, pay, purchase, refund, log out, sign out, logout): it still refuses some harmless controls such as "Save search", and misses writing controls such as "Place order" or "Add to cart". A short built-in list of view-only labels (`Remove filter`, `Clear filters`, `Clear search`, `Remove columns`, whole labels only) is exempt; `defaultExceptions: false` turns it off. If the check still gets in the way, set `defaultControls: false` and name your app's own verbs in `controls.text`.
-- **Not covered:** anything outside the guarded context, such as other contexts, request clients the guard cannot reach, and code that removes the guard. See [What it cannot see](#what-it-cannot-see). The boundary is a restricted account: give the run credentials that cannot write, and use the guard to catch mistakes before they reach it.
-- **Cost:** Playwright turns off the HTTP cache while a route is installed, so every load fetches every asset again. Service workers are blocked, so an app that waits for `navigator.serviceWorker.ready` hangs. Every WebSocket a page opens goes through Playwright's routing, which makes socket traffic noticeably slower.
+- **Requests.** A request that is not GET, HEAD or OPTIONS is blocked at the network layer unless your `allow` list says it is a read; `writes` always wins. [Rules](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/api.md#writes-and-controls).
+- **Clicks.** A click, submit or Enter or Space on a control labelled with a destructive verb (Save, Delete, Pay) is stopped in the page, with a console warning that says why. [How the guard works](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#how-the-guard-works).
+- **Log.** Every blocked, observed, mocked or suspect event is one JSON line. [The audit log](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#the-audit-log).
+- **Enforced:** every HTTP request of a guarded context is judged, except WebSocket messages and sends from a page being left, a `SharedWorker` or `fetchLater`. [WebSocket frames](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#websocket-frames-and-suspect-gets), [leaving pages](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#leaving-pages-shared-workers-and-fetchlater).
+- **Heuristic:** writes are told by method and controls by label, so apps that read over POST need an allow list and a harmless "Save search" is refused. [Writing an allow list](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/guide.md#writing-an-allow-list).
+- **Not covered:** anything outside the guarded context, and code that removes the guard. See [What it cannot see](#what-it-cannot-see).
+- **Cost:** no HTTP cache, no service workers, slower WebSockets. [Limits](https://github.com/SandeepTakasi/playwright-write-guard/blob/main/docs/limits.md).
 
 See it work end to end, with a local page and server, in the walkthrough at [demo/README.md](demo/README.md) (`node demo/run.mjs`).
 
