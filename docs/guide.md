@@ -104,6 +104,10 @@ To let a GraphQL endpoint's queries through and block its mutations, list its UR
 
 A POST to that URL has its body read. A query is allowed, and a mutation or subscription is blocked even when an `allow` signature matches the same request. A batch is allowed only when every operation in it is a query. A body the guard cannot classify (a persisted query with no query text, an unbalanced document, a body that is not JSON, an `operationName` that names no operation) is not judged by `graphql`: it falls through to `allow` and then the method rule, so a POST stays blocked unless you allow it. Anchor each entry with `^`, as for `allow`: an unanchored one prints a warning.
 
+**Using automatic persisted queries (APQ)?** The client's first request sends only a hash, with no query text, so `graphql` cannot classify it and it is blocked; the client then sees a network error instead of a "persisted query not found" reply and does not retry with the full query, so reads stay broken. Either have the client send hashed queries as GET (Apollo Client's `useGETForHashedQueries: true`), which the guard treats as reads, or turn APQ off where the guard runs, or allow the hashes of your read operations by hand, for example `{ "method": "POST", "url": "^https://app[.]example[.]test/graphql$", "body": "\"sha256Hash\":\"(3f1c9a...|8b2e47...)\"" }` with the full hashes. Never allow every hash: mutations are sent as hashes too.
+
+**GraphQL over WebSocket** (`graphql-ws`, subscriptions transports) is not read by `graphql`, and those messages can carry mutations. Name them with `websocketWrites`, for example `"websocketWrites": ["\"query\"\\s*:\\s*\"\\s*mutation\\b"]` (see [WebSocket frames](#websocket-frames-and-suspect-gets)).
+
 A `writes` signature is still checked first, so an old `writes` body pattern such as `"body": "mutation"` keeps winning: a query that merely mentions the word `mutation` stays blocked until you remove that pattern. With `graphql` in place you can usually drop it.
 
 Without `graphql`, allow the URL and name the mutations in `writes` by a body pattern, which also works for persisted queries and for bodies the guard cannot read:

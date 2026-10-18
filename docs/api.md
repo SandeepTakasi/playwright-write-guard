@@ -411,6 +411,7 @@ and stderr is `3 x POST https://app.example.test/graphql: GraphQL, add the URL t
 - Reads that send no query text (persisted GraphQL queries without an operation name): when nothing in the method, URL, headers or body tells such a read from a write, a signature that allows the endpoint allows its mutations too. With `graphql`, such a request is not classified and falls through to `allow` and the method rule in the same way.
 - With `graphql`, only the operation type is judged: a query whose resolvers write is allowed.
 - GET requests to a `graphql` endpoint stay reads: their `?query=` is not parsed.
+- A `graphql` body that repeats a key (two `query` keys, say) is judged by the last one, as `JSON.parse` keeps it; a server whose JSON parser keeps the first one could run a different operation. Most servers keep the last or reject the body.
 - Bodies that are not text in the page (`FormData`, `Blob`, file uploads) are not parsed under `graphql`, so they fall through to `allow` and the method rule.
 - Request bodies unless `logBodies` is `true`, and header values: events record the method, URL, content type and header names. `logBodies` is off by default because bodies can hold credentials and personal data.
 - Bodies sent as `form` or `multipart` through an `APIRequestContext`, and Node `fetch` bodies that are not strings (streams, `FormData`, `URLSearchParams`, Blob, buffers) or that belong to a `Request` given to `fetch`: they are not judged by body (the method, URL and headers still are).
