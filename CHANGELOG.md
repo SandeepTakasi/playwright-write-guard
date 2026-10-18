@@ -2,6 +2,24 @@
 
 Newest first. Breaking and behaviour changes come first in each release. The guard is a safety net, not a security boundary; the README lists what it cannot see.
 
+## 0.7.0 (2026-10-18)
+
+### Behaviour and type changes
+
+- Types: `Config` gains `graphql?: string[]`, and `CompiledConfig` gains a required `graphql: RegExp[]` (empty when the key is absent). Code that builds a `CompiledConfig` by hand needs the new field; code that calls `compileConfig` does not.
+- `playwright-write-guard-suggest` prints a new hint for a group whose path ends with `/graphql`: `GraphQL, add the URL to "graphql" to allow its queries` (was `GraphQL, add an anchored body pattern`). Its stdout is unchanged.
+- With `graphql` absent or empty, every request decision is the same as in 0.6.1.
+
+### New
+
+- `graphql`: a list of GraphQL endpoint URL patterns. For a POST to a listed endpoint the guard reads the body (one operation, a batch, or an `application/graphql` document), selects the operation the server would run (by `operationName`, or the only one), and allows the request when every selected operation is a query. A mutation or subscription is a write and is blocked under `read-only` even when `allow` matches it. A body it cannot classify (persisted queries with no query text, unparseable or ambiguous documents) falls through to `allow` and the method rule as before. Strings, block strings and comments are skipped, so the word `mutation` inside them does not count. Pages being left are judged the same way. An entry that matches the empty string is refused, and one not anchored with `^` prints a warning, as for `allow` URLs.
+
+### Docs
+
+- The README's config example uses `graphql` instead of a body regex that depended on JSON key order.
+- The guide has a GraphQL section, including how an old `writes` body pattern interacts with the new key.
+- Both limit lists name what `graphql` does not cover: queries whose resolvers write, GET requests to the endpoint, and bodies a page cannot read as text.
+
 ## 0.6.1 (2026-10-18)
 
 ### New
